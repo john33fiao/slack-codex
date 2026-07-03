@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, fmt, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -50,10 +50,11 @@ impl SlackApiClient {
         if response.ok {
             response.url.ok_or(SlackError::MissingField("url"))
         } else {
-            Err(SlackError::Api {
-                method: "apps.connections.open",
-                error: response.error.unwrap_or_else(|| "unknown_error".to_owned()),
-            })
+            Err(slack_api_error(
+                "apps.connections.open",
+                response.error,
+                response.response_metadata,
+            ))
         }
     }
 
@@ -89,10 +90,11 @@ impl SlackApiClient {
                 ts: response.ts.ok_or(SlackError::MissingField("ts"))?,
             })
         } else {
-            Err(SlackError::Api {
-                method: "chat.postMessage",
-                error: response.error.unwrap_or_else(|| "unknown_error".to_owned()),
-            })
+            Err(slack_api_error(
+                "chat.postMessage",
+                response.error,
+                response.response_metadata,
+            ))
         }
     }
 
@@ -111,7 +113,6 @@ impl SlackApiClient {
             .json(&GetUploadUrlExternalRequest {
                 filename,
                 length: bytes.len(),
-                snippet_type: "text",
             })
             .send()
             .await?
@@ -120,10 +121,11 @@ impl SlackApiClient {
             .await?;
 
         if !upload.ok {
-            return Err(SlackError::Api {
-                method: "files.getUploadURLExternal",
-                error: upload.error.unwrap_or_else(|| "unknown_error".to_owned()),
-            });
+            return Err(slack_api_error(
+                "files.getUploadURLExternal",
+                upload.error,
+                upload.response_metadata,
+            ));
         }
         let upload_url = upload
             .upload_url
@@ -161,10 +163,11 @@ impl SlackApiClient {
         if complete.ok {
             Ok(())
         } else {
-            Err(SlackError::Api {
-                method: "files.completeUploadExternal",
-                error: complete.error.unwrap_or_else(|| "unknown_error".to_owned()),
-            })
+            Err(slack_api_error(
+                "files.completeUploadExternal",
+                complete.error,
+                complete.response_metadata,
+            ))
         }
     }
 }
@@ -224,6 +227,7 @@ struct OpenConnectionResponse {
     ok: bool,
     url: Option<String>,
     error: Option<String>,
+    response_metadata: Option<SlackResponseMetadata>,
 }
 
 #[derive(Debug, Serialize)]
@@ -242,13 +246,13 @@ struct ChatPostMessageResponse {
     channel: Option<String>,
     ts: Option<String>,
     error: Option<String>,
+    response_metadata: Option<SlackResponseMetadata>,
 }
 
 #[derive(Debug, Serialize)]
 struct GetUploadUrlExternalRequest<'a> {
     filename: &'a str,
     length: usize,
-    snippet_type: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,6 +261,7 @@ struct GetUploadUrlExternalResponse {
     upload_url: Option<String>,
     file_id: Option<String>,
     error: Option<String>,
+    response_metadata: Option<SlackResponseMetadata>,
 }
 
 #[derive(Debug, Serialize)]
@@ -277,6 +282,13 @@ struct CompleteUploadExternalFile {
 struct CompleteUploadExternalResponse {
     ok: bool,
     error: Option<String>,
+    response_metadata: Option<SlackResponseMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackResponseMetadata {
+    #[serde(default)]
+    messages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -652,8 +664,12 @@ pub fn ping_text(hostname: &str, started_at: Instant) -> String {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SlackError {
-    #[error("slack api {method} failed with {error}")]
-    Api { method: &'static str, error: String },
+    #[error("slack api {method} failed with {error}{detail}")]
+    Api {
+        method: &'static str,
+        error: String,
+        detail: SlackApiErrorDetail,
+    },
     #[error("slack api response missing required field {0}")]
     MissingField(&'static str),
     #[error(transparent)]
@@ -662,6 +678,64 @@ pub enum SlackError {
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SlackApiErrorDetail(String);
+
+impl fmt::Display for SlackApiErrorDetail {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+fn slack_api_error(
+    method: &'static str,
+    error: Option<String>,
+    response_metadata: Option<SlackResponseMetadata>,
+) -> SlackError {
+    SlackError::Api {
+        method,
+        error: error.unwrap_or_else(|| "unknown_error".to_owned()),
+        detail: slack_api_error_detail(response_metadata),
+    }
+}
+
+fn slack_api_error_detail(response_metadata: Option<SlackResponseMetadata>) -> SlackApiErrorDetail {
+    let messages = response_metadata
+        .into_iter()
+        .flat_map(|metadata| metadata.messages)
+        .filter_map(|message| sanitize_api_diagnostic(&message))
+        .collect::<Vec<_>>();
+
+    if messages.is_empty() {
+        SlackApiErrorDetail(String::new())
+    } else {
+        SlackApiErrorDetail(format!("; metadata: {}", messages.join("; ")))
+    }
+}
+
+fn sanitize_api_diagnostic(message: &str) -> Option<String> {
+    let message = message.trim();
+    if message.is_empty() {
+        return None;
+    }
+
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("slack_bot_token")
+        || lower.contains("slack_app_token")
+        || lower.contains("slack_signing_secret")
+        || lower.contains("xoxb-")
+        || lower.contains("xapp-")
+    {
+        return Some("[redacted slack api diagnostic]".to_owned());
+    }
+
+    Some(take_chars(message, 300))
+}
+
+fn take_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 impl From<SlackError> for HashMap<String, String> {
@@ -797,6 +871,56 @@ mod tests {
                 filename: "codex-output.txt".to_owned(),
                 content: "123456".to_owned()
             }
+        );
+    }
+
+    #[test]
+    fn get_upload_url_request_omits_snippet_type_for_plain_text_file() {
+        let request = GetUploadUrlExternalRequest {
+            filename: "codex-output.txt",
+            length: "a가".as_bytes().len(),
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "filename": "codex-output.txt",
+                "length": 4
+            })
+        );
+        assert!(encoded.get("snippet_type").is_none());
+    }
+
+    #[test]
+    fn slack_api_error_includes_response_metadata_messages() {
+        let error = slack_api_error(
+            "files.getUploadURLExternal",
+            Some("invalid_arguments".to_owned()),
+            Some(SlackResponseMetadata {
+                messages: vec!["[ERROR] unsupported field: snippet_type".to_owned()],
+            }),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "slack api files.getUploadURLExternal failed with invalid_arguments; metadata: [ERROR] unsupported field: snippet_type"
+        );
+    }
+
+    #[test]
+    fn slack_api_error_redacts_token_like_metadata_messages() {
+        let error = slack_api_error(
+            "files.getUploadURLExternal",
+            Some("invalid_arguments".to_owned()),
+            Some(SlackResponseMetadata {
+                messages: vec!["SLACK_BOT_TOKEN appeared here".to_owned()],
+            }),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "slack api files.getUploadURLExternal failed with invalid_arguments; metadata: [redacted slack api diagnostic]"
         );
     }
 

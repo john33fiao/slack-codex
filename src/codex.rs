@@ -1,4 +1,11 @@
-use std::{process::Stdio, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    env,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -6,6 +13,60 @@ use tokio::{process::Command, time};
 
 pub const BLOCKED_CHILD_ENV: [&str; 3] =
     ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_SIGNING_SECRET"];
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CodexRequest {
+    pub prompt: String,
+    pub workspace: Option<PathBuf>,
+}
+
+impl CodexRequest {
+    pub fn parse(input: &str) -> Result<Self, CodexError> {
+        let input = input.trim();
+        if matches!(input, "--workspace" | "--cd") {
+            return Err(CodexError::InvalidWorkspaceRequest);
+        }
+        for prefix in ["--workspace=", "--cd="] {
+            if let Some(rest) = input.strip_prefix(prefix) {
+                let (workspace, prompt) = parse_workspace_value(rest)?;
+                return Ok(Self { prompt, workspace });
+            }
+        }
+        for prefix in ["--workspace ", "--cd "] {
+            if let Some(rest) = input.strip_prefix(prefix) {
+                let (workspace, prompt) = parse_workspace_value(rest)?;
+                return Ok(Self { prompt, workspace });
+            }
+        }
+
+        Ok(Self {
+            prompt: input.to_owned(),
+            workspace: None,
+        })
+    }
+}
+
+fn parse_workspace_value(value: &str) -> Result<(Option<PathBuf>, String), CodexError> {
+    let value = value.trim_start();
+    if value.is_empty() {
+        return Err(CodexError::InvalidWorkspaceRequest);
+    }
+
+    if let Some(rest) = value.strip_prefix('"') {
+        let Some(end) = rest.find('"') else {
+            return Err(CodexError::InvalidWorkspaceRequest);
+        };
+        let workspace = &rest[..end];
+        let prompt = rest[end + 1..].trim_start();
+        return Ok((Some(PathBuf::from(workspace)), prompt.to_owned()));
+    }
+
+    let (workspace, prompt) = value.split_once(char::is_whitespace).unwrap_or((value, ""));
+    Ok((
+        Some(PathBuf::from(workspace)),
+        prompt.trim_start().to_owned(),
+    ))
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CodexSessionOutput {
@@ -22,34 +83,126 @@ pub struct CodexResumeOutput {
 
 #[async_trait]
 pub trait CodexExecutor: Send + Sync {
-    async fn start_session(&self, prompt: &str) -> Result<CodexSessionOutput, CodexError>;
+    async fn start_session(&self, request: CodexRequest) -> Result<CodexSessionOutput, CodexError>;
     async fn resume_session(
         &self,
         session_id: &str,
-        prompt: &str,
+        request: CodexRequest,
     ) -> Result<CodexResumeOutput, CodexError>;
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ChildEnvPolicy {
+    allowed_names: Vec<String>,
+}
+
+impl ChildEnvPolicy {
+    pub fn new(allowed_names: Vec<String>) -> Self {
+        let allowed_names = allowed_names
+            .into_iter()
+            .filter(|name| !is_blocked_child_env(name))
+            .collect();
+        Self { allowed_names }
+    }
+
+    pub fn collect_from_current(&self) -> Vec<(String, String)> {
+        let env_map = env::vars().collect::<HashMap<_, _>>();
+        self.collect_from_map(&env_map)
+    }
+
+    pub fn collect_from_map(&self, values: &HashMap<String, String>) -> Vec<(String, String)> {
+        self.allowed_names
+            .iter()
+            .filter(|name| !is_blocked_child_env(name))
+            .filter_map(|name| values.get(name).map(|value| (name.clone(), value.clone())))
+            .collect()
+    }
+}
+
+fn is_blocked_child_env(name: &str) -> bool {
+    BLOCKED_CHILD_ENV
+        .iter()
+        .any(|blocked| blocked.eq_ignore_ascii_case(name))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WorkspacePolicy {
+    allowed_roots: Vec<PathBuf>,
+}
+
+impl WorkspacePolicy {
+    pub fn new(allowed_roots: Vec<PathBuf>) -> Self {
+        Self { allowed_roots }
+    }
+
+    pub fn validate(&self, requested: Option<&Path>) -> Result<PathBuf, CodexError> {
+        let requested = match requested {
+            Some(path) => path.to_path_buf(),
+            None => env::current_dir()?,
+        };
+        let requested = requested
+            .canonicalize()
+            .map_err(|_| CodexError::WorkspaceNotAllowed)?;
+
+        for root in &self.allowed_roots {
+            let Ok(root) = root.canonicalize() else {
+                continue;
+            };
+            if requested == root || requested.starts_with(&root) {
+                return Ok(requested);
+            }
+        }
+
+        Err(CodexError::WorkspaceNotAllowed)
+    }
 }
 
 pub struct CodexCli {
     timeout: Duration,
+    env_policy: ChildEnvPolicy,
+    workspace_policy: WorkspacePolicy,
 }
 
 impl CodexCli {
-    pub fn new(timeout_secs: u64) -> Self {
+    pub fn new(
+        timeout_secs: u64,
+        env_policy: ChildEnvPolicy,
+        workspace_policy: WorkspacePolicy,
+    ) -> Self {
         Self {
             timeout: Duration::from_secs(timeout_secs),
+            env_policy,
+            workspace_policy,
         }
     }
 
-    pub fn shared(timeout_secs: u64) -> Arc<Self> {
-        Arc::new(Self::new(timeout_secs))
+    pub fn shared(
+        timeout_secs: u64,
+        env_policy: ChildEnvPolicy,
+        workspace_policy: WorkspacePolicy,
+    ) -> Arc<Self> {
+        Arc::new(Self::new(timeout_secs, env_policy, workspace_policy))
     }
 }
 
 #[async_trait]
 impl CodexExecutor for CodexCli {
-    async fn start_session(&self, prompt: &str) -> Result<CodexSessionOutput, CodexError> {
-        let output = run_codex(["exec", "--json", prompt], self.timeout).await?;
+    async fn start_session(&self, request: CodexRequest) -> Result<CodexSessionOutput, CodexError> {
+        let workspace = self
+            .workspace_policy
+            .validate(request.workspace.as_deref())?;
+        let output = run_codex(
+            vec![
+                "exec".to_owned(),
+                "--json".to_owned(),
+                "--cd".to_owned(),
+                workspace.to_string_lossy().into_owned(),
+                request.prompt,
+            ],
+            self.timeout,
+            &self.env_policy,
+        )
+        .await?;
         ensure_success(&output)?;
         let session_id = parse_session_id(&output.stdout).ok_or(CodexError::MissingSessionId)?;
 
@@ -63,9 +216,23 @@ impl CodexExecutor for CodexCli {
     async fn resume_session(
         &self,
         session_id: &str,
-        prompt: &str,
+        request: CodexRequest,
     ) -> Result<CodexResumeOutput, CodexError> {
-        let output = run_codex(["exec", "resume", session_id, prompt], self.timeout).await?;
+        if request.workspace.is_some() {
+            return Err(CodexError::WorkspaceOnlyOnStart);
+        }
+
+        let output = run_codex(
+            vec![
+                "exec".to_owned(),
+                "resume".to_owned(),
+                session_id.to_owned(),
+                request.prompt,
+            ],
+            self.timeout,
+            &self.env_policy,
+        )
+        .await?;
         ensure_success(&output)?;
 
         Ok(CodexResumeOutput {
@@ -75,11 +242,12 @@ impl CodexExecutor for CodexCli {
     }
 }
 
-async fn run_codex<const N: usize>(
-    args: [&str; N],
+async fn run_codex(
+    args: Vec<String>,
     timeout: Duration,
+    env_policy: &ChildEnvPolicy,
 ) -> Result<ProcessOutput, CodexError> {
-    let child = codex_command()
+    let child = codex_command(env_policy)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -97,8 +265,12 @@ async fn run_codex<const N: usize>(
     })
 }
 
-fn codex_command() -> Command {
+fn codex_command(env_policy: &ChildEnvPolicy) -> Command {
     let mut command = Command::new("codex");
+    command.env_clear();
+    for (name, value) in env_policy.collect_from_current() {
+        command.env(name, value);
+    }
     for name in BLOCKED_CHILD_ENV {
         command.env_remove(name);
     }
@@ -167,6 +339,12 @@ pub enum CodexError {
     },
     #[error("codex JSON output did not include a session_id")]
     MissingSessionId,
+    #[error("invalid workspace request")]
+    InvalidWorkspaceRequest,
+    #[error("workspace is not allowed")]
+    WorkspaceNotAllowed,
+    #[error("workspace can only be selected when starting a session")]
+    WorkspaceOnlyOnStart,
 }
 
 impl CodexError {
@@ -193,13 +371,35 @@ impl CodexError {
             Self::MissingSessionId => {
                 "Codex completed, but no session_id was found in JSON output.".to_owned()
             }
+            Self::InvalidWorkspaceRequest => {
+                "Workspace option is invalid. Use `--workspace <path> <prompt>`.".to_owned()
+            }
+            Self::WorkspaceNotAllowed => {
+                "Requested workspace is not in CODEX_ALLOWED_WORKSPACES.".to_owned()
+            }
+            Self::WorkspaceOnlyOnStart => {
+                "Workspace can only be selected when starting a new `/codex` session.".to_owned()
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("slack-codex-{name}-{stamp}"))
+    }
 
     #[test]
     fn parses_session_id_from_json_lines() {
@@ -234,6 +434,77 @@ mod tests {
     fn tail_limits_by_chars() {
         assert_eq!(tail("abcdef", 3), "def");
         assert_eq!(tail("가나다라마", 2), "라마");
+    }
+
+    #[test]
+    fn child_env_policy_allows_only_named_non_slack_vars() {
+        let policy = ChildEnvPolicy::new(vec![
+            "HOME".to_owned(),
+            "SLACK_BOT_TOKEN".to_owned(),
+            "PATH".to_owned(),
+        ]);
+        let values = HashMap::from([
+            ("HOME".to_owned(), "/home/test".to_owned()),
+            ("PATH".to_owned(), "/bin".to_owned()),
+            ("SLACK_BOT_TOKEN".to_owned(), "xoxb-secret".to_owned()),
+            ("OTHER".to_owned(), "value".to_owned()),
+        ]);
+
+        let collected = policy.collect_from_map(&values);
+
+        assert_eq!(
+            collected,
+            vec![
+                ("HOME".to_owned(), "/home/test".to_owned()),
+                ("PATH".to_owned(), "/bin".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_policy_allows_child_path_and_rejects_sibling() {
+        let root = unique_temp_dir("allowed");
+        let child = root.join("child");
+        let sibling = unique_temp_dir("sibling");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let policy = WorkspacePolicy::new(vec![root.clone()]);
+
+        assert_eq!(
+            policy.validate(Some(&child)).unwrap(),
+            child.canonicalize().unwrap()
+        );
+        assert!(matches!(
+            policy.validate(Some(&sibling)),
+            Err(CodexError::WorkspaceNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn workspace_policy_rejects_traversal_outside_allowed_root() {
+        let root = unique_temp_dir("root");
+        let sibling = unique_temp_dir("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let requested = root.join("..").join(sibling.file_name().unwrap());
+        let policy = WorkspacePolicy::new(vec![root]);
+
+        assert!(matches!(
+            policy.validate(Some(&requested)),
+            Err(CodexError::WorkspaceNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn codex_request_parses_workspace_prefixes() {
+        let request = CodexRequest::parse(r#"--workspace "C:\repo path" do work"#).unwrap();
+
+        assert_eq!(request.workspace, Some(PathBuf::from(r#"C:\repo path"#)));
+        assert_eq!(request.prompt, "do work");
+
+        let request = CodexRequest::parse("--cd=./repo do work").unwrap();
+        assert_eq!(request.workspace, Some(PathBuf::from("./repo")));
+        assert_eq!(request.prompt, "do work");
     }
 
     #[test]

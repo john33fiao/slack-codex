@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::{
-    codex::{CodexError, CodexExecutor},
+    codex::{CodexError, CodexExecutor, CodexRequest},
     sessions::{ProcessedEvent, SessionStatus, SessionStore, StateError},
     slack::{SlackError, SlackMessageEvent, SlashCommandPayload},
 };
@@ -90,8 +90,8 @@ impl SessionLifecycle {
             return Ok(());
         }
 
-        let prompt = command.text.trim();
-        if prompt.is_empty() {
+        let request = CodexRequest::parse(command.text.trim())?;
+        if request.prompt.is_empty() {
             return Ok(());
         }
 
@@ -100,7 +100,7 @@ impl SessionLifecycle {
             .start_session_thread(&command.channel_id, &command.user_id)
             .await?;
 
-        match self.codex.start_session(prompt).await {
+        match self.codex.start_session(request).await {
             Ok(output) => {
                 self.sessions
                     .save_session(&thread.thread_ts, &output.session_id)?;
@@ -153,7 +153,7 @@ impl SessionLifecycle {
             .set_session_status(&record.thread_ts, SessionStatus::Running)?;
         let resume_result = self
             .codex
-            .resume_session(&record.session_id, event.text.trim())
+            .resume_session(&record.session_id, CodexRequest::parse(event.text.trim())?)
             .await;
         self.sessions
             .set_session_status(&record.thread_ts, SessionStatus::Idle)?;
@@ -211,8 +211,11 @@ mod tests {
 
     #[async_trait]
     impl CodexExecutor for FakeCodex {
-        async fn start_session(&self, prompt: &str) -> Result<CodexSessionOutput, CodexError> {
-            self.starts.lock().unwrap().push(prompt.to_owned());
+        async fn start_session(
+            &self,
+            request: CodexRequest,
+        ) -> Result<CodexSessionOutput, CodexError> {
+            self.starts.lock().unwrap().push(request.prompt);
             Ok(CodexSessionOutput {
                 session_id: "session-1".to_owned(),
                 stdout: String::new(),
@@ -223,7 +226,7 @@ mod tests {
         async fn resume_session(
             &self,
             session_id: &str,
-            prompt: &str,
+            request: CodexRequest,
         ) -> Result<CodexResumeOutput, CodexError> {
             {
                 let mut active = self.active_resumes.lock().unwrap();
@@ -235,7 +238,7 @@ mod tests {
             self.resumes
                 .lock()
                 .unwrap()
-                .push((session_id.to_owned(), prompt.to_owned()));
+                .push((session_id.to_owned(), request.prompt));
             *self.active_resumes.lock().unwrap() -= 1;
             Ok(CodexResumeOutput {
                 stdout: String::new(),

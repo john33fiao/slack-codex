@@ -6,7 +6,7 @@ pub mod slack;
 
 use std::{sync::Arc, time::Instant};
 
-use codex::CodexCli;
+use codex::{ChildEnvPolicy, CodexCli, WorkspacePolicy};
 use config::AppConfig;
 use lifecycle::SessionLifecycle;
 use sessions::{SessionStore, SqliteStateStore};
@@ -35,7 +35,11 @@ pub async fn run() -> Result<(), AppError> {
     );
     let sessions = SqliteStateStore::shared(&config.queue_db_path)?;
     sessions.recover_running_sessions()?;
-    let codex = CodexCli::shared(config.max_session_timeout_secs);
+    let codex = CodexCli::shared(
+        config.max_session_timeout_secs,
+        ChildEnvPolicy::new(config.child_env_allowlist.clone()),
+        WorkspacePolicy::new(config.allowed_workspaces.clone()),
+    );
     let lifecycle = SessionLifecycle::shared(codex, Arc::new(api.clone()), sessions);
     let runner = SocketModeRunner::new(config, api, lifecycle, Instant::now());
     runner.run().await?;

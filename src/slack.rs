@@ -7,6 +7,7 @@ use serde_json::Value;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
+    codex::CodexRequest,
     config::{AppConfig, SecretString},
     lifecycle::{SessionLifecycle, SlackPublisher, SlackThread},
     sessions::ProcessedEvent,
@@ -449,23 +450,32 @@ fn handle_slash_command(
             },
             None,
         ),
-        "/codex" if command.text.trim().is_empty() => (
-            SlackResponsePayload {
-                response_type: ResponseType::Ephemeral,
-                text: "Usage: /codex <prompt>".to_owned(),
-            },
-            None,
-        ),
-        "/codex" => (
-            SlackResponsePayload {
-                response_type: ResponseType::Ephemeral,
-                text: "Starting Codex. A thread reply will appear shortly.".to_owned(),
-            },
-            Some(SocketAction::StartCodex {
-                processed_event: ProcessedEvent::new(event_key, None, "slash_commands"),
-                command,
-            }),
-        ),
+        "/codex" => match CodexRequest::parse(command.text.trim()) {
+            Ok(request) if request.prompt.is_empty() => (
+                SlackResponsePayload {
+                    response_type: ResponseType::Ephemeral,
+                    text: "Usage: /codex <prompt>".to_owned(),
+                },
+                None,
+            ),
+            Ok(_) => (
+                SlackResponsePayload {
+                    response_type: ResponseType::Ephemeral,
+                    text: "Starting Codex. A thread reply will appear shortly.".to_owned(),
+                },
+                Some(SocketAction::StartCodex {
+                    processed_event: ProcessedEvent::new(event_key, None, "slash_commands"),
+                    command,
+                }),
+            ),
+            Err(error) => (
+                SlackResponsePayload {
+                    response_type: ResponseType::Ephemeral,
+                    text: error.user_message(),
+                },
+                None,
+            ),
+        },
         _ => (
             SlackResponsePayload {
                 response_type: ResponseType::Ephemeral,
@@ -531,6 +541,8 @@ mod tests {
             max_session_timeout_secs: 600,
             codex_output_max_chars: 39_000,
             queue_db_path: PathBuf::from("./data/test.db"),
+            child_env_allowlist: vec!["PATH".to_owned()],
+            allowed_workspaces: vec![PathBuf::from(".")],
         }
     }
 
@@ -597,6 +609,28 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn invalid_workspace_prefix_returns_ephemeral_error_without_action() {
+        let envelope = SocketEnvelope {
+            envelope_id: "E2B".to_owned(),
+            envelope_type: "slash_commands".to_owned(),
+            accepts_response_payload: true,
+            payload: serde_json::json!({
+                "team_id": "T123",
+                "channel_id": "D123",
+                "user_id": "U123",
+                "command": "/codex",
+                "text": "--workspace"
+            }),
+        };
+
+        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+        let text = prepared.ack.unwrap().payload.unwrap().text;
+
+        assert!(text.contains("Workspace option is invalid"));
+        assert_eq!(prepared.action, None);
     }
 
     #[test]

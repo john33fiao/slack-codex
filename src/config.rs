@@ -33,6 +33,8 @@ pub struct AppConfig {
     pub max_session_timeout_secs: u64,
     pub codex_output_max_chars: usize,
     pub queue_db_path: PathBuf,
+    pub child_env_allowlist: Vec<String>,
+    pub allowed_workspaces: Vec<PathBuf>,
 }
 
 impl AppConfig {
@@ -58,6 +60,12 @@ impl AppConfig {
         let queue_db_path = optional_string(&mut lookup, "QUEUE_DB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("./data/sessions.db"));
+        let child_env_allowlist = optional_string(&mut lookup, "CODEX_CHILD_ENV_ALLOWLIST")
+            .map(|value| split_csv_vec(&value))
+            .unwrap_or_else(default_child_env_allowlist);
+        let allowed_workspaces = optional_string(&mut lookup, "CODEX_ALLOWED_WORKSPACES")
+            .map(|value| split_path_list(&value))
+            .unwrap_or_default();
 
         Ok(Self {
             slack_bot_token,
@@ -68,6 +76,8 @@ impl AppConfig {
             max_session_timeout_secs,
             codex_output_max_chars,
             queue_db_path,
+            child_env_allowlist,
+            allowed_workspaces,
         })
     }
 }
@@ -114,12 +124,39 @@ fn optional_usize(
 }
 
 fn split_csv(value: &str) -> HashSet<String> {
+    split_csv_vec(value).into_iter().collect()
+}
+
+fn split_csv_vec(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn split_path_list(value: &str) -> Vec<PathBuf> {
+    value
+        .split([';', ','])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn default_child_env_allowlist() -> Vec<String> {
+    [
+        "HOME",
+        "PATH",
+        "USER",
+        "SHELL",
+        "CODEX_HOME",
+        "CODEX_PROFILE_ROOT",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
 }
 
 fn hostname_fallback() -> String {
@@ -165,6 +202,11 @@ mod tests {
             ("MAX_SESSION_TIMEOUT_SECS".to_owned(), "30".to_owned()),
             ("CODEX_OUTPUT_MAX_CHARS".to_owned(), "1000".to_owned()),
             ("QUEUE_DB_PATH".to_owned(), "./tmp/test.db".to_owned()),
+            (
+                "CODEX_CHILD_ENV_ALLOWLIST".to_owned(),
+                "HOME,PATH,SLACK_BOT_TOKEN".to_owned(),
+            ),
+            ("CODEX_ALLOWED_WORKSPACES".to_owned(), "./a;./b".to_owned()),
         ]);
 
         let config = AppConfig::from_map(&values).unwrap();
@@ -178,6 +220,18 @@ mod tests {
         assert_eq!(config.max_session_timeout_secs, 30);
         assert_eq!(config.codex_output_max_chars, 1000);
         assert_eq!(config.queue_db_path, PathBuf::from("./tmp/test.db"));
+        assert_eq!(
+            config.child_env_allowlist,
+            vec![
+                "HOME".to_owned(),
+                "PATH".to_owned(),
+                "SLACK_BOT_TOKEN".to_owned()
+            ]
+        );
+        assert_eq!(
+            config.allowed_workspaces,
+            vec![PathBuf::from("./a"), PathBuf::from("./b")]
+        );
     }
 
     #[test]

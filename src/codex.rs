@@ -318,6 +318,28 @@ pub fn tail(value: &str, max_chars: usize) -> String {
     chars.into_iter().collect()
 }
 
+pub fn display_output(stdout: &str) -> String {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return "Codex completed without text output.".to_owned();
+    }
+    redact_sensitive_text(trimmed)
+}
+
+pub fn redact_sensitive_text(value: &str) -> String {
+    value
+        .lines()
+        .map(|line| {
+            if BLOCKED_CHILD_ENV.iter().any(|name| line.contains(name)) {
+                "[redacted sensitive output line]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ProcessOutput {
     status_code: Option<i32>,
@@ -359,12 +381,13 @@ impl CodexError {
                 stderr_tail,
                 ..
             } => {
-                if stderr_tail.trim().is_empty() {
+                let stderr_tail = redact_sensitive_text(stderr_tail.trim());
+                if stderr_tail.is_empty() {
                     format!("Codex command exited with status {status_code:?}.")
                 } else {
                     format!(
                         "Codex command exited with status {status_code:?}. Error tail:\n```text\n{}\n```",
-                        stderr_tail.trim()
+                        stderr_tail
                     )
                 }
             }
@@ -512,5 +535,15 @@ mod tests {
         assert!(BLOCKED_CHILD_ENV.contains(&"SLACK_BOT_TOKEN"));
         assert!(BLOCKED_CHILD_ENV.contains(&"SLACK_APP_TOKEN"));
         assert!(BLOCKED_CHILD_ENV.contains(&"SLACK_SIGNING_SECRET"));
+    }
+
+    #[test]
+    fn display_output_redacts_sensitive_lines() {
+        let output = "ok\nSLACK_BOT_TOKEN=xoxb-secret\nstill ok";
+
+        assert_eq!(
+            display_output(output),
+            "ok\n[redacted sensitive output line]\nstill ok"
+        );
     }
 }

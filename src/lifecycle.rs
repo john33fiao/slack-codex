@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::{
-    codex::{CodexError, CodexExecutor, CodexRequest},
+    codex::{display_output, CodexError, CodexExecutor, CodexRequest},
     sessions::{ProcessedEvent, SessionStatus, SessionStore, StateError},
     slack::{SlackError, SlackMessageEvent, SlashCommandPayload},
 };
@@ -31,6 +31,14 @@ pub trait SlackPublisher: Send + Sync {
         channel_id: &str,
         thread_ts: &str,
         text: &str,
+    ) -> Result<(), SlackError>;
+
+    async fn publish_result(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        text: &str,
+        max_chars: usize,
     ) -> Result<(), SlackError>;
 }
 
@@ -57,6 +65,7 @@ pub struct SessionLifecycle {
     publisher: Arc<dyn SlackPublisher>,
     sessions: Arc<dyn SessionStore>,
     locks: Arc<SessionLocks>,
+    output_max_chars: usize,
 }
 
 impl SessionLifecycle {
@@ -64,12 +73,14 @@ impl SessionLifecycle {
         codex: Arc<dyn CodexExecutor>,
         publisher: Arc<dyn SlackPublisher>,
         sessions: Arc<dyn SessionStore>,
+        output_max_chars: usize,
     ) -> Self {
         Self {
             codex,
             publisher,
             sessions,
             locks: Arc::new(SessionLocks::default()),
+            output_max_chars,
         }
     }
 
@@ -77,8 +88,9 @@ impl SessionLifecycle {
         codex: Arc<dyn CodexExecutor>,
         publisher: Arc<dyn SlackPublisher>,
         sessions: Arc<dyn SessionStore>,
+        output_max_chars: usize,
     ) -> Arc<Self> {
-        Arc::new(Self::new(codex, publisher, sessions))
+        Arc::new(Self::new(codex, publisher, sessions, output_max_chars))
     }
 
     pub async fn start_from_slash(
@@ -105,10 +117,11 @@ impl SessionLifecycle {
                 self.sessions
                     .save_session(&thread.thread_ts, &output.session_id)?;
                 self.publisher
-                    .post_thread_message(
+                    .publish_result(
                         &thread.channel_id,
                         &thread.thread_ts,
-                        "Codex session started. Reply in this thread to continue.",
+                        &display_output(&output.stdout),
+                        self.output_max_chars,
                     )
                     .await?;
             }
@@ -159,9 +172,14 @@ impl SessionLifecycle {
             .set_session_status(&record.thread_ts, SessionStatus::Idle)?;
 
         match resume_result {
-            Ok(_) => {
+            Ok(output) => {
                 self.publisher
-                    .post_thread_message(&event.channel, thread_ts, "Codex resume completed.")
+                    .publish_result(
+                        &event.channel,
+                        thread_ts,
+                        &display_output(&output.stdout),
+                        self.output_max_chars,
+                    )
                     .await?;
             }
             Err(error) => {
@@ -218,7 +236,7 @@ mod tests {
             self.starts.lock().unwrap().push(request.prompt);
             Ok(CodexSessionOutput {
                 session_id: "session-1".to_owned(),
-                stdout: String::new(),
+                stdout: "started output".to_owned(),
                 stderr: String::new(),
             })
         }
@@ -241,7 +259,7 @@ mod tests {
                 .push((session_id.to_owned(), request.prompt));
             *self.active_resumes.lock().unwrap() -= 1;
             Ok(CodexResumeOutput {
-                stdout: String::new(),
+                stdout: "resume output".to_owned(),
                 stderr: String::new(),
             })
         }
@@ -278,6 +296,16 @@ mod tests {
             ));
             Ok(())
         }
+
+        async fn publish_result(
+            &self,
+            channel_id: &str,
+            thread_ts: &str,
+            text: &str,
+            _max_chars: usize,
+        ) -> Result<(), SlackError> {
+            self.post_thread_message(channel_id, thread_ts, text).await
+        }
     }
 
     fn processed_event(key: &str) -> ProcessedEvent {
@@ -289,7 +317,8 @@ mod tests {
         let codex = Arc::new(FakeCodex::default());
         let publisher = Arc::new(FakePublisher::default());
         let sessions = MemorySessionStore::shared();
-        let lifecycle = SessionLifecycle::new(codex.clone(), publisher, sessions.clone());
+        let lifecycle =
+            SessionLifecycle::new(codex.clone(), publisher.clone(), sessions.clone(), 1000);
 
         lifecycle
             .start_from_slash(
@@ -314,6 +343,12 @@ mod tests {
                 .session_id,
             "session-1".to_owned()
         );
+        assert!(publisher
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, text)| text == "started output"));
     }
 
     #[tokio::test]
@@ -321,7 +356,7 @@ mod tests {
         let codex = Arc::new(FakeCodex::default());
         let publisher = Arc::new(FakePublisher::default());
         let sessions = MemorySessionStore::shared();
-        let lifecycle = SessionLifecycle::new(codex.clone(), publisher, sessions);
+        let lifecycle = SessionLifecycle::new(codex.clone(), publisher, sessions, 1000);
         let command = SlashCommandPayload {
             team_id: "T1".to_owned(),
             channel_id: "D1".to_owned(),
@@ -348,7 +383,7 @@ mod tests {
         let publisher = Arc::new(FakePublisher::default());
         let sessions = MemorySessionStore::shared();
         sessions.save_session("171.0001", "session-1").unwrap();
-        let lifecycle = SessionLifecycle::new(codex.clone(), publisher, sessions);
+        let lifecycle = SessionLifecycle::new(codex.clone(), publisher.clone(), sessions, 1000);
 
         lifecycle
             .resume_from_message(
@@ -368,6 +403,12 @@ mod tests {
             codex.resumes.lock().unwrap().as_slice(),
             [("session-1".to_owned(), "continue".to_owned())]
         );
+        assert!(publisher
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, text)| text == "resume output"));
     }
 
     #[tokio::test]
@@ -376,7 +417,12 @@ mod tests {
         let publisher = Arc::new(FakePublisher::default());
         let sessions = MemorySessionStore::shared();
         sessions.save_session("171.0001", "session-1").unwrap();
-        let lifecycle = Arc::new(SessionLifecycle::new(codex.clone(), publisher, sessions));
+        let lifecycle = Arc::new(SessionLifecycle::new(
+            codex.clone(),
+            publisher,
+            sessions,
+            1000,
+        ));
         let event = SlackMessageEvent {
             channel: "D1".to_owned(),
             user: Some("U1".to_owned()),
@@ -400,7 +446,7 @@ mod tests {
         let codex = Arc::new(FakeCodex::default());
         let publisher = Arc::new(FakePublisher::default());
         let sessions = MemorySessionStore::shared();
-        let lifecycle = SessionLifecycle::new(codex.clone(), publisher.clone(), sessions);
+        let lifecycle = SessionLifecycle::new(codex.clone(), publisher.clone(), sessions, 1000);
 
         lifecycle
             .resume_from_message(

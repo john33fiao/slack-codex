@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -15,6 +16,9 @@ use crate::{
 
 const APPS_CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
 const CHAT_POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
+const FILES_GET_UPLOAD_URL_EXTERNAL_URL: &str = "https://slack.com/api/files.getUploadURLExternal";
+const FILES_COMPLETE_UPLOAD_EXTERNAL_URL: &str =
+    "https://slack.com/api/files.completeUploadExternal";
 
 #[derive(Clone)]
 pub struct SlackApiClient {
@@ -91,6 +95,78 @@ impl SlackApiClient {
             })
         }
     }
+
+    pub async fn upload_text_file(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        filename: &str,
+        content: &str,
+    ) -> Result<(), SlackError> {
+        let bytes = content.as_bytes().to_vec();
+        let upload = self
+            .http
+            .post(FILES_GET_UPLOAD_URL_EXTERNAL_URL)
+            .bearer_auth(self.bot_token.expose())
+            .json(&GetUploadUrlExternalRequest {
+                filename,
+                length: bytes.len(),
+                snippet_type: "text",
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<GetUploadUrlExternalResponse>()
+            .await?;
+
+        if !upload.ok {
+            return Err(SlackError::Api {
+                method: "files.getUploadURLExternal",
+                error: upload.error.unwrap_or_else(|| "unknown_error".to_owned()),
+            });
+        }
+        let upload_url = upload
+            .upload_url
+            .ok_or(SlackError::MissingField("upload_url"))?;
+        let file_id = upload.file_id.ok_or(SlackError::MissingField("file_id"))?;
+
+        self.http
+            .post(upload_url)
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(bytes)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let complete = self
+            .http
+            .post(FILES_COMPLETE_UPLOAD_EXTERNAL_URL)
+            .bearer_auth(self.bot_token.expose())
+            .json(&CompleteUploadExternalRequest {
+                files: vec![CompleteUploadExternalFile {
+                    id: file_id,
+                    title: filename.to_owned(),
+                }],
+                channel_id: channel,
+                thread_ts,
+                initial_comment:
+                    "Codex output was too long for a Slack message; uploaded as a file.",
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<CompleteUploadExternalResponse>()
+            .await?;
+
+        if complete.ok {
+            Ok(())
+        } else {
+            Err(SlackError::Api {
+                method: "files.completeUploadExternal",
+                error: complete.error.unwrap_or_else(|| "unknown_error".to_owned()),
+            })
+        }
+    }
 }
 
 #[async_trait]
@@ -123,6 +199,24 @@ impl SlackPublisher for SlackApiClient {
         self.post_message(channel_id, Some(thread_ts), text).await?;
         Ok(())
     }
+
+    async fn publish_result(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        text: &str,
+        max_chars: usize,
+    ) -> Result<(), SlackError> {
+        match plan_result_publish(text, max_chars) {
+            ResultPublishPlan::Message(text) => {
+                self.post_thread_message(channel_id, thread_ts, &text).await
+            }
+            ResultPublishPlan::ExternalFile { filename, content } => {
+                self.upload_text_file(channel_id, thread_ts, &filename, &content)
+                    .await
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,10 +244,62 @@ struct ChatPostMessageResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct GetUploadUrlExternalRequest<'a> {
+    filename: &'a str,
+    length: usize,
+    snippet_type: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetUploadUrlExternalResponse {
+    ok: bool,
+    upload_url: Option<String>,
+    file_id: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompleteUploadExternalRequest<'a> {
+    files: Vec<CompleteUploadExternalFile>,
+    channel_id: &'a str,
+    thread_ts: &'a str,
+    initial_comment: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct CompleteUploadExternalFile {
+    id: String,
+    title: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteUploadExternalResponse {
+    ok: bool,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PostedMessage {
     pub channel: String,
     pub ts: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ResultPublishPlan {
+    Message(String),
+    ExternalFile { filename: String, content: String },
+}
+
+pub fn plan_result_publish(text: &str, max_chars: usize) -> ResultPublishPlan {
+    if text.chars().count() <= max_chars {
+        ResultPublishPlan::Message(text.to_owned())
+    } else {
+        ResultPublishPlan::ExternalFile {
+            filename: "codex-output.txt".to_owned(),
+            content: text.to_owned(),
+        }
+    }
 }
 
 pub struct SocketModeRunner {
@@ -631,6 +777,25 @@ mod tests {
 
         assert!(text.contains("Workspace option is invalid"));
         assert_eq!(prepared.action, None);
+    }
+
+    #[test]
+    fn result_publish_plan_uses_message_under_limit() {
+        assert_eq!(
+            plan_result_publish("short", 5),
+            ResultPublishPlan::Message("short".to_owned())
+        );
+    }
+
+    #[test]
+    fn result_publish_plan_uses_external_file_over_limit() {
+        assert_eq!(
+            plan_result_publish("123456", 5),
+            ResultPublishPlan::ExternalFile {
+                filename: "codex-output.txt".to_owned(),
+                content: "123456".to_owned()
+            }
+        );
     }
 
     #[test]

@@ -40,7 +40,12 @@ pub async fn run() -> Result<(), AppError> {
         ChildEnvPolicy::new(config.child_env_allowlist.clone()),
         WorkspacePolicy::new(config.allowed_workspaces.clone()),
     );
-    let lifecycle = SessionLifecycle::shared(codex, Arc::new(api.clone()), sessions);
+    let lifecycle = SessionLifecycle::shared(
+        codex,
+        Arc::new(api.clone()),
+        sessions,
+        config.codex_output_max_chars,
+    );
     let runner = SocketModeRunner::new(config, api, lifecycle, Instant::now());
     runner.run().await?;
 

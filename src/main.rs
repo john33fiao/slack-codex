@@ -1,11 +1,7 @@
-fn main() {
-    println!("slack-codex bootstrap");
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn package_name_is_stable() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "slack-codex");
+#[tokio::main]
+async fn main() {
+    if let Err(error) = slack_codex::run().await {
+        eprintln!("{error}");
+        std::process::exit(1);
     }
 }

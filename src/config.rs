@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fmt,
+    path::PathBuf,
 };
 
 #[derive(Clone, Eq, PartialEq)]
@@ -31,6 +32,7 @@ pub struct AppConfig {
     pub bot_hostname: String,
     pub max_session_timeout_secs: u64,
     pub codex_output_max_chars: usize,
+    pub queue_db_path: PathBuf,
 }
 
 impl AppConfig {
@@ -53,6 +55,9 @@ impl AppConfig {
             optional_string(&mut lookup, "BOT_HOSTNAME").unwrap_or_else(hostname_fallback);
         let max_session_timeout_secs = optional_u64(&mut lookup, "MAX_SESSION_TIMEOUT_SECS", 600)?;
         let codex_output_max_chars = optional_usize(&mut lookup, "CODEX_OUTPUT_MAX_CHARS", 39_000)?;
+        let queue_db_path = optional_string(&mut lookup, "QUEUE_DB_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("./data/sessions.db"));
 
         Ok(Self {
             slack_bot_token,
@@ -62,6 +67,7 @@ impl AppConfig {
             bot_hostname,
             max_session_timeout_secs,
             codex_output_max_chars,
+            queue_db_path,
         })
     }
 }
@@ -158,6 +164,7 @@ mod tests {
             ("BOT_HOSTNAME".to_owned(), "desk".to_owned()),
             ("MAX_SESSION_TIMEOUT_SECS".to_owned(), "30".to_owned()),
             ("CODEX_OUTPUT_MAX_CHARS".to_owned(), "1000".to_owned()),
+            ("QUEUE_DB_PATH".to_owned(), "./tmp/test.db".to_owned()),
         ]);
 
         let config = AppConfig::from_map(&values).unwrap();
@@ -170,6 +177,7 @@ mod tests {
         assert_eq!(config.bot_hostname, "desk");
         assert_eq!(config.max_session_timeout_secs, 30);
         assert_eq!(config.codex_output_max_chars, 1000);
+        assert_eq!(config.queue_db_path, PathBuf::from("./tmp/test.db"));
     }
 
     #[test]

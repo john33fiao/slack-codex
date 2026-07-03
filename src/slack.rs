@@ -9,6 +9,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::{
     config::{AppConfig, SecretString},
     lifecycle::{SessionLifecycle, SlackPublisher, SlackThread},
+    sessions::ProcessedEvent,
 };
 
 const APPS_CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
@@ -226,8 +227,14 @@ impl SocketModeRunner {
         let lifecycle = Arc::clone(&self.lifecycle);
         tokio::spawn(async move {
             let result = match action {
-                SocketAction::StartCodex(command) => lifecycle.start_from_slash(command).await,
-                SocketAction::ResumeCodex(event) => lifecycle.resume_from_message(event).await,
+                SocketAction::StartCodex {
+                    command,
+                    processed_event,
+                } => lifecycle.start_from_slash(command, processed_event).await,
+                SocketAction::ResumeCodex {
+                    event,
+                    processed_event,
+                } => lifecycle.resume_from_message(event, processed_event).await,
             };
 
             if let Err(error) = result {
@@ -301,8 +308,14 @@ pub struct PreparedSocketEvent {
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum SocketAction {
-    StartCodex(SlashCommandPayload),
-    ResumeCodex(SlackMessageEvent),
+    StartCodex {
+        command: SlashCommandPayload,
+        processed_event: ProcessedEvent,
+    },
+    ResumeCodex {
+        event: SlackMessageEvent,
+        processed_event: ProcessedEvent,
+    },
 }
 
 pub fn prepare_envelope(
@@ -328,8 +341,10 @@ fn prepare_slash_command(
     started_at: Instant,
     envelope: SocketEnvelope,
 ) -> PreparedSocketEvent {
+    let event_key = slack_event_key(Some(&envelope.envelope_id), &envelope.payload)
+        .unwrap_or_else(|| envelope.envelope_id.clone());
     let (response, action) = match serde_json::from_value::<SlashCommandPayload>(envelope.payload) {
-        Ok(command) => handle_slash_command(config, started_at, command),
+        Ok(command) => handle_slash_command(config, started_at, command, event_key),
         Err(error) => (
             SlackResponsePayload {
                 response_type: ResponseType::Ephemeral,
@@ -353,7 +368,16 @@ fn prepare_slash_command(
 }
 
 fn prepare_events_api(envelope: SocketEnvelope) -> PreparedSocketEvent {
-    let action = parse_message_event(envelope.payload).map(SocketAction::ResumeCodex);
+    let event_key = slack_event_key(Some(&envelope.envelope_id), &envelope.payload)
+        .unwrap_or_else(|| envelope.envelope_id.clone());
+    let action = parse_message_event(envelope.payload).map(|event| SocketAction::ResumeCodex {
+        processed_event: ProcessedEvent::new(
+            event_key,
+            Some(event.thread_ts().to_owned()),
+            "events_api",
+        ),
+        event,
+    });
 
     PreparedSocketEvent {
         ack: Some(SocketAck {
@@ -362,6 +386,25 @@ fn prepare_events_api(envelope: SocketEnvelope) -> PreparedSocketEvent {
         }),
         action,
     }
+}
+
+pub fn slack_event_key(envelope_id: Option<&str>, payload: &Value) -> Option<String> {
+    if let Some(envelope_id) = envelope_id.filter(|value| !value.is_empty()) {
+        return Some(envelope_id.to_owned());
+    }
+    if let Some(event_id) = payload.get("event_id").and_then(Value::as_str) {
+        return Some(event_id.to_owned());
+    }
+
+    let event = payload.get("event").unwrap_or(payload);
+    if let Some(client_msg_id) = event.get("client_msg_id").and_then(Value::as_str) {
+        return Some(client_msg_id.to_owned());
+    }
+
+    let channel = event.get("channel").and_then(Value::as_str)?;
+    let ts = event.get("ts").and_then(Value::as_str)?;
+    let user = event.get("user").and_then(Value::as_str)?;
+    Some(format!("{channel}:{ts}:{user}"))
 }
 
 pub fn parse_message_event(payload: Value) -> Option<SlackMessageEvent> {
@@ -386,6 +429,7 @@ fn handle_slash_command(
     config: &AppConfig,
     started_at: Instant,
     command: SlashCommandPayload,
+    event_key: String,
 ) -> (SlackResponsePayload, Option<SocketAction>) {
     if !is_command_allowed(config, &command) {
         return (
@@ -417,7 +461,10 @@ fn handle_slash_command(
                 response_type: ResponseType::Ephemeral,
                 text: "Starting Codex. A thread reply will appear shortly.".to_owned(),
             },
-            Some(SocketAction::StartCodex(command)),
+            Some(SocketAction::StartCodex {
+                processed_event: ProcessedEvent::new(event_key, None, "slash_commands"),
+                command,
+            }),
         ),
         _ => (
             SlackResponsePayload {
@@ -469,7 +516,7 @@ impl From<SlackError> for HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{path::PathBuf, time::Duration};
 
     use super::*;
     use crate::config::SecretString;
@@ -483,6 +530,7 @@ mod tests {
             bot_hostname: "desk".to_owned(),
             max_session_timeout_secs: 600,
             codex_output_max_chars: 39_000,
+            queue_db_path: PathBuf::from("./data/test.db"),
         }
     }
 
@@ -538,13 +586,16 @@ mod tests {
             .contains("Starting Codex"));
         assert_eq!(
             prepared.action,
-            Some(SocketAction::StartCodex(SlashCommandPayload {
-                team_id: "T123".to_owned(),
-                channel_id: "D123".to_owned(),
-                user_id: "U123".to_owned(),
-                command: "/codex".to_owned(),
-                text: "do work".to_owned()
-            }))
+            Some(SocketAction::StartCodex {
+                processed_event: ProcessedEvent::new("E2", None, "slash_commands"),
+                command: SlashCommandPayload {
+                    team_id: "T123".to_owned(),
+                    channel_id: "D123".to_owned(),
+                    user_id: "U123".to_owned(),
+                    command: "/codex".to_owned(),
+                    text: "do work".to_owned()
+                }
+            })
         );
     }
 
@@ -591,13 +642,60 @@ mod tests {
 
         assert_eq!(
             prepared.action,
-            Some(SocketAction::ResumeCodex(SlackMessageEvent {
-                channel: "D123".to_owned(),
-                user: Some("U123".to_owned()),
-                text: "continue".to_owned(),
-                ts: "171.0002".to_owned(),
-                thread_ts: Some("171.0001".to_owned())
-            }))
+            Some(SocketAction::ResumeCodex {
+                processed_event: ProcessedEvent::new(
+                    "E4",
+                    Some("171.0001".to_owned()),
+                    "events_api"
+                ),
+                event: SlackMessageEvent {
+                    channel: "D123".to_owned(),
+                    user: Some("U123".to_owned()),
+                    text: "continue".to_owned(),
+                    ts: "171.0002".to_owned(),
+                    thread_ts: Some("171.0001".to_owned())
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn event_key_priority_matches_architecture() {
+        let payload = serde_json::json!({
+            "event_id": "Ev1",
+            "event": {
+                "client_msg_id": "Cm1",
+                "channel": "D123",
+                "ts": "171.0002",
+                "user": "U123"
+            }
+        });
+        assert_eq!(
+            slack_event_key(Some("Envelope1"), &payload).as_deref(),
+            Some("Envelope1")
+        );
+        assert_eq!(slack_event_key(None, &payload).as_deref(), Some("Ev1"));
+
+        let no_event_id = serde_json::json!({
+            "event": {
+                "client_msg_id": "Cm1",
+                "channel": "D123",
+                "ts": "171.0002",
+                "user": "U123"
+            }
+        });
+        assert_eq!(slack_event_key(None, &no_event_id).as_deref(), Some("Cm1"));
+
+        let fallback = serde_json::json!({
+            "event": {
+                "channel": "D123",
+                "ts": "171.0002",
+                "user": "U123"
+            }
+        });
+        assert_eq!(
+            slack_event_key(None, &fallback).as_deref(),
+            Some("D123:171.0002:U123")
         );
     }
 

@@ -9,13 +9,15 @@ use std::{sync::Arc, time::Instant};
 use codex::CodexCli;
 use config::AppConfig;
 use lifecycle::SessionLifecycle;
-use sessions::MemorySessionStore;
+use sessions::{SessionStore, SqliteStateStore};
 use slack::{SlackApiClient, SocketModeRunner};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error(transparent)]
     Config(#[from] config::ConfigError),
+    #[error(transparent)]
+    State(#[from] sessions::StateError),
     #[error(transparent)]
     Slack(#[from] slack::SlackError),
 }
@@ -31,7 +33,8 @@ pub async fn run() -> Result<(), AppError> {
         config.slack_bot_token.clone(),
         config.slack_app_token.clone(),
     );
-    let sessions = MemorySessionStore::shared();
+    let sessions = SqliteStateStore::shared(&config.queue_db_path)?;
+    sessions.recover_running_sessions()?;
     let codex = CodexCli::shared(config.max_session_timeout_secs);
     let lifecycle = SessionLifecycle::shared(codex, Arc::new(api.clone()), sessions);
     let runner = SocketModeRunner::new(config, api, lifecycle, Instant::now());

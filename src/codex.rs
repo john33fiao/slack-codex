@@ -128,17 +128,25 @@ fn is_blocked_child_env(name: &str) -> bool {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct WorkspacePolicy {
     allowed_roots: Vec<PathBuf>,
+    default_workspace: Option<PathBuf>,
 }
 
 impl WorkspacePolicy {
-    pub fn new(allowed_roots: Vec<PathBuf>) -> Self {
-        Self { allowed_roots }
+    pub fn new(allowed_roots: Vec<PathBuf>, default_workspace: Option<PathBuf>) -> Self {
+        Self {
+            allowed_roots,
+            default_workspace,
+        }
     }
 
     pub fn validate(&self, requested: Option<&Path>) -> Result<PathBuf, CodexError> {
         let requested = match requested {
             Some(path) => path.to_path_buf(),
-            None => env::current_dir()?,
+            None => self
+                .default_workspace
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(env::current_dir)?,
         };
         let requested = requested
             .canonicalize()
@@ -158,6 +166,7 @@ impl WorkspacePolicy {
 }
 
 pub struct CodexCli {
+    executable: PathBuf,
     timeout: Duration,
     env_policy: ChildEnvPolicy,
     workspace_policy: WorkspacePolicy,
@@ -165,11 +174,13 @@ pub struct CodexCli {
 
 impl CodexCli {
     pub fn new(
+        executable: PathBuf,
         timeout_secs: u64,
         env_policy: ChildEnvPolicy,
         workspace_policy: WorkspacePolicy,
     ) -> Self {
         Self {
+            executable,
             timeout: Duration::from_secs(timeout_secs),
             env_policy,
             workspace_policy,
@@ -177,11 +188,17 @@ impl CodexCli {
     }
 
     pub fn shared(
+        executable: PathBuf,
         timeout_secs: u64,
         env_policy: ChildEnvPolicy,
         workspace_policy: WorkspacePolicy,
     ) -> Arc<Self> {
-        Arc::new(Self::new(timeout_secs, env_policy, workspace_policy))
+        Arc::new(Self::new(
+            executable,
+            timeout_secs,
+            env_policy,
+            workspace_policy,
+        ))
     }
 }
 
@@ -192,6 +209,7 @@ impl CodexExecutor for CodexCli {
             .workspace_policy
             .validate(request.workspace.as_deref())?;
         let output = run_codex(
+            &self.executable,
             vec![
                 "exec".to_owned(),
                 "--json".to_owned(),
@@ -223,6 +241,7 @@ impl CodexExecutor for CodexCli {
         }
 
         let output = run_codex(
+            &self.executable,
             vec![
                 "exec".to_owned(),
                 "resume".to_owned(),
@@ -243,11 +262,12 @@ impl CodexExecutor for CodexCli {
 }
 
 async fn run_codex(
+    executable: &Path,
     args: Vec<String>,
     timeout: Duration,
     env_policy: &ChildEnvPolicy,
 ) -> Result<ProcessOutput, CodexError> {
-    let child = codex_command(env_policy)
+    let child = codex_command(executable, env_policy)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -265,8 +285,8 @@ async fn run_codex(
     })
 }
 
-fn codex_command(env_policy: &ChildEnvPolicy) -> Command {
-    let mut command = Command::new("codex");
+fn codex_command(executable: &Path, env_policy: &ChildEnvPolicy) -> Command {
+    let mut command = Command::new(executable);
     command.env_clear();
     for (name, value) in env_policy.collect_from_current() {
         command.env(name, value);
@@ -491,7 +511,7 @@ mod tests {
         let sibling = unique_temp_dir("sibling");
         fs::create_dir_all(&child).unwrap();
         fs::create_dir_all(&sibling).unwrap();
-        let policy = WorkspacePolicy::new(vec![root.clone()]);
+        let policy = WorkspacePolicy::new(vec![root.clone()], None);
 
         assert_eq!(
             policy.validate(Some(&child)).unwrap(),
@@ -510,10 +530,33 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&sibling).unwrap();
         let requested = root.join("..").join(sibling.file_name().unwrap());
-        let policy = WorkspacePolicy::new(vec![root]);
+        let policy = WorkspacePolicy::new(vec![root], None);
 
         assert!(matches!(
             policy.validate(Some(&requested)),
+            Err(CodexError::WorkspaceNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn workspace_policy_uses_default_workspace_when_request_omits_one() {
+        let root = unique_temp_dir("default-root");
+        fs::create_dir_all(&root).unwrap();
+        let policy = WorkspacePolicy::new(vec![root.clone()], Some(root.clone()));
+
+        assert_eq!(policy.validate(None).unwrap(), root.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn workspace_policy_rejects_default_workspace_outside_allowed_root() {
+        let root = unique_temp_dir("default-allowed");
+        let outside = unique_temp_dir("default-outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let policy = WorkspacePolicy::new(vec![root], Some(outside));
+
+        assert!(matches!(
+            policy.validate(None),
             Err(CodexError::WorkspaceNotAllowed)
         ));
     }

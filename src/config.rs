@@ -32,8 +32,10 @@ pub struct AppConfig {
     pub bot_hostname: String,
     pub max_session_timeout_secs: u64,
     pub codex_output_max_chars: usize,
+    pub codex_cli_path: PathBuf,
     pub queue_db_path: PathBuf,
     pub child_env_allowlist: Vec<String>,
+    pub default_workspace: Option<PathBuf>,
     pub allowed_workspaces: Vec<PathBuf>,
 }
 
@@ -57,12 +59,17 @@ impl AppConfig {
             optional_string(&mut lookup, "BOT_HOSTNAME").unwrap_or_else(hostname_fallback);
         let max_session_timeout_secs = optional_u64(&mut lookup, "MAX_SESSION_TIMEOUT_SECS", 600)?;
         let codex_output_max_chars = optional_usize(&mut lookup, "CODEX_OUTPUT_MAX_CHARS", 39_000)?;
+        let codex_cli_path = optional_string(&mut lookup, "CODEX_CLI_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("codex"));
         let queue_db_path = optional_string(&mut lookup, "QUEUE_DB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("./data/sessions.db"));
         let child_env_allowlist = optional_string(&mut lookup, "CODEX_CHILD_ENV_ALLOWLIST")
             .map(|value| split_csv_vec(&value))
             .unwrap_or_else(default_child_env_allowlist);
+        let default_workspace =
+            optional_string(&mut lookup, "CODEX_DEFAULT_WORKSPACE").map(PathBuf::from);
         let allowed_workspaces = optional_string(&mut lookup, "CODEX_ALLOWED_WORKSPACES")
             .map(|value| split_path_list(&value))
             .unwrap_or_default();
@@ -75,8 +82,10 @@ impl AppConfig {
             bot_hostname,
             max_session_timeout_secs,
             codex_output_max_chars,
+            codex_cli_path,
             queue_db_path,
             child_env_allowlist,
+            default_workspace,
             allowed_workspaces,
         })
     }
@@ -201,11 +210,13 @@ mod tests {
             ("BOT_HOSTNAME".to_owned(), "desk".to_owned()),
             ("MAX_SESSION_TIMEOUT_SECS".to_owned(), "30".to_owned()),
             ("CODEX_OUTPUT_MAX_CHARS".to_owned(), "1000".to_owned()),
+            ("CODEX_CLI_PATH".to_owned(), "/bin/codex".to_owned()),
             ("QUEUE_DB_PATH".to_owned(), "./tmp/test.db".to_owned()),
             (
                 "CODEX_CHILD_ENV_ALLOWLIST".to_owned(),
                 "HOME,PATH,SLACK_BOT_TOKEN".to_owned(),
             ),
+            ("CODEX_DEFAULT_WORKSPACE".to_owned(), "./a".to_owned()),
             ("CODEX_ALLOWED_WORKSPACES".to_owned(), "./a;./b".to_owned()),
         ]);
 
@@ -219,6 +230,7 @@ mod tests {
         assert_eq!(config.bot_hostname, "desk");
         assert_eq!(config.max_session_timeout_secs, 30);
         assert_eq!(config.codex_output_max_chars, 1000);
+        assert_eq!(config.codex_cli_path, PathBuf::from("/bin/codex"));
         assert_eq!(config.queue_db_path, PathBuf::from("./tmp/test.db"));
         assert_eq!(
             config.child_env_allowlist,
@@ -228,6 +240,7 @@ mod tests {
                 "SLACK_BOT_TOKEN".to_owned()
             ]
         );
+        assert_eq!(config.default_workspace, Some(PathBuf::from("./a")));
         assert_eq!(
             config.allowed_workspaces,
             vec![PathBuf::from("./a"), PathBuf::from("./b")]

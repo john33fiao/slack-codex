@@ -686,8 +686,10 @@ mod tests {
             bot_hostname: "desk".to_owned(),
             max_session_timeout_secs: 600,
             codex_output_max_chars: 39_000,
+            codex_cli_path: PathBuf::from("codex"),
             queue_db_path: PathBuf::from("./data/test.db"),
             child_env_allowlist: vec!["PATH".to_owned()],
+            default_workspace: None,
             allowed_workspaces: vec![PathBuf::from(".")],
         }
     }

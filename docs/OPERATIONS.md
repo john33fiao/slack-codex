@@ -7,7 +7,7 @@ This document is public-safe. Keep real Slack credentials, local usernames, abso
 Each host should keep these files in a private install directory:
 
 - `slack-codex` binary or `slack-codex.exe`
-- `.env` with real Slack app tokens, allowed team/user IDs, Codex profile values, DB path, and allowed workspaces
+- `.env` with real Slack app tokens, allowed team/user IDs, Codex profile values, default and allowed workspaces, and DB path
 - runtime `sessions.db`
 - service-manager files or wrapper scripts containing real host paths
 - logs
@@ -16,7 +16,10 @@ Use `.env.example` only as a placeholder template.
 
 ## Windows Service Registration
 
-Use a Windows service wrapper that can set the working directory to the private install directory. The app loads `.env` from its working directory.
+Use a Windows service wrapper that can set the working directory to the private install directory. The app loads `.env` from the executable directory first, then falls back to the working directory search used by `dotenvy`.
+Set `CODEX_DEFAULT_WORKSPACE` when `/codex <prompt>` should run from a workspace that is different from the service working directory.
+Quote Windows paths in `.env` with single quotes because backslashes are parsed as escapes by the dotenv parser.
+Set `CODEX_CLI_PATH` to the absolute `codex.exe` path when the host service cannot find `codex` through `PATH`.
 
 Placeholder shape:
 

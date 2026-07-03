@@ -1,0 +1,43 @@
+/target/
+
+# Local agent workspace and planning docs
+AGENTS.md
+.agents/
+.codex/
+docs/TODO.md
+docs/WBS.md
+docs/tickets/
+docs/refs/
+docs/deps/
+docs/decisions/
+
+# Local secrets and host-specific config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime state
+/data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.log
+logs/
+sessions/
+slack-events/
+
+# Scratch outputs
+work/
+outputs/
+tmp/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

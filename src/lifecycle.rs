@@ -114,8 +114,11 @@ impl SessionLifecycle {
 
         match self.codex.start_session(request).await {
             Ok(output) => {
-                self.sessions
-                    .save_session(&thread.thread_ts, &output.session_id)?;
+                self.sessions.save_session(
+                    &thread.thread_ts,
+                    &output.session_id,
+                    Some(&output.workspace),
+                )?;
                 self.publisher
                     .publish_result(
                         &thread.channel_id,
@@ -166,7 +169,11 @@ impl SessionLifecycle {
             .set_session_status(&record.thread_ts, SessionStatus::Running)?;
         let resume_result = self
             .codex
-            .resume_session(&record.session_id, CodexRequest::parse(event.text.trim())?)
+            .resume_session(
+                &record.session_id,
+                record.workspace.clone(),
+                CodexRequest::parse(event.text.trim())?,
+            )
             .await;
         self.sessions
             .set_session_status(&record.thread_ts, SessionStatus::Idle)?;
@@ -210,7 +217,11 @@ pub enum LifecycleError {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Mutex, time::Duration};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Mutex,
+        time::Duration,
+    };
 
     use crate::{
         codex::{CodexResumeOutput, CodexSessionOutput},
@@ -222,7 +233,7 @@ mod tests {
     #[derive(Default)]
     struct FakeCodex {
         starts: Mutex<Vec<String>>,
-        resumes: Mutex<Vec<(String, String)>>,
+        resumes: Mutex<Vec<(String, String, String)>>,
         active_resumes: Mutex<usize>,
         max_active_resumes: Mutex<usize>,
     }
@@ -236,6 +247,7 @@ mod tests {
             self.starts.lock().unwrap().push(request.prompt);
             Ok(CodexSessionOutput {
                 session_id: "session-1".to_owned(),
+                workspace: PathBuf::from(r"C:\repo"),
                 stdout: "started output".to_owned(),
                 stderr: String::new(),
             })
@@ -244,6 +256,7 @@ mod tests {
         async fn resume_session(
             &self,
             session_id: &str,
+            workspace: Option<PathBuf>,
             request: CodexRequest,
         ) -> Result<CodexResumeOutput, CodexError> {
             {
@@ -253,10 +266,13 @@ mod tests {
                 *max_active = (*max_active).max(*active);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
-            self.resumes
-                .lock()
-                .unwrap()
-                .push((session_id.to_owned(), request.prompt));
+            self.resumes.lock().unwrap().push((
+                session_id.to_owned(),
+                workspace
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                request.prompt,
+            ));
             *self.active_resumes.lock().unwrap() -= 1;
             Ok(CodexResumeOutput {
                 stdout: "resume output".to_owned(),
@@ -382,7 +398,9 @@ mod tests {
         let codex = Arc::new(FakeCodex::default());
         let publisher = Arc::new(FakePublisher::default());
         let sessions = MemorySessionStore::shared();
-        sessions.save_session("171.0001", "session-1").unwrap();
+        sessions
+            .save_session("171.0001", "session-1", Some(Path::new(r"C:\repo")))
+            .unwrap();
         let lifecycle = SessionLifecycle::new(codex.clone(), publisher.clone(), sessions, 1000);
 
         lifecycle
@@ -401,7 +419,11 @@ mod tests {
 
         assert_eq!(
             codex.resumes.lock().unwrap().as_slice(),
-            [("session-1".to_owned(), "continue".to_owned())]
+            [(
+                "session-1".to_owned(),
+                r"C:\repo".to_owned(),
+                "continue".to_owned()
+            )]
         );
         assert!(publisher
             .messages
@@ -416,7 +438,9 @@ mod tests {
         let codex = Arc::new(FakeCodex::default());
         let publisher = Arc::new(FakePublisher::default());
         let sessions = MemorySessionStore::shared();
-        sessions.save_session("171.0001", "session-1").unwrap();
+        sessions
+            .save_session("171.0001", "session-1", Some(Path::new(r"C:\repo")))
+            .unwrap();
         let lifecycle = Arc::new(SessionLifecycle::new(
             codex.clone(),
             publisher,

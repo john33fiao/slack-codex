@@ -20,6 +20,7 @@ slack-codex
 ## Core Invariants
 
 - One Slack thread maps to one Codex session.
+- A registered thread resumes from the workspace validated when that session started.
 - Messages outside a registered thread never resume a session.
 - The host is selected by choosing the bot DM, not by automatic routing.
 - The same Slack input must be processed at most once.
@@ -31,6 +32,7 @@ slack-codex
 CREATE TABLE sessions (
   thread_ts   TEXT PRIMARY KEY,
   session_id  TEXT NOT NULL,
+  workspace   TEXT,
   status      TEXT NOT NULL DEFAULT 'idle',
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL

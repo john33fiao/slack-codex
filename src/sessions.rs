@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -11,6 +11,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 pub struct SessionRecord {
     pub thread_ts: String,
     pub session_id: String,
+    pub workspace: Option<PathBuf>,
     pub status: SessionStatus,
 }
 
@@ -58,7 +59,12 @@ impl ProcessedEvent {
 }
 
 pub trait SessionStore: Send + Sync {
-    fn save_session(&self, thread_ts: &str, session_id: &str) -> Result<(), StateError>;
+    fn save_session(
+        &self,
+        thread_ts: &str,
+        session_id: &str,
+        workspace: Option<&Path>,
+    ) -> Result<(), StateError>;
     fn get_session(&self, thread_ts: &str) -> Result<Option<SessionRecord>, StateError>;
     fn set_session_status(&self, thread_ts: &str, status: SessionStatus) -> Result<(), StateError>;
     fn try_record_event(&self, event: &ProcessedEvent) -> Result<bool, StateError>;
@@ -105,6 +111,7 @@ impl SqliteStateStore {
             CREATE TABLE IF NOT EXISTS sessions (
               thread_ts   TEXT PRIMARY KEY,
               session_id  TEXT NOT NULL,
+              workspace   TEXT,
               status      TEXT NOT NULL DEFAULT 'idle',
               created_at  TEXT NOT NULL,
               updated_at  TEXT NOT NULL
@@ -118,23 +125,47 @@ impl SqliteStateStore {
             );
             "#,
         )?;
+        ensure_workspace_column(&connection)?;
         Ok(())
     }
 }
 
+fn ensure_workspace_column(connection: &Connection) -> Result<(), StateError> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_workspace = false;
+    for column in columns {
+        if column? == "workspace" {
+            has_workspace = true;
+            break;
+        }
+    }
+    if !has_workspace {
+        connection.execute("ALTER TABLE sessions ADD COLUMN workspace TEXT", [])?;
+    }
+    Ok(())
+}
+
 impl SessionStore for SqliteStateStore {
-    fn save_session(&self, thread_ts: &str, session_id: &str) -> Result<(), StateError> {
+    fn save_session(
+        &self,
+        thread_ts: &str,
+        session_id: &str,
+        workspace: Option<&Path>,
+    ) -> Result<(), StateError> {
+        let workspace = workspace.map(|path| path.to_string_lossy().into_owned());
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection.execute(
             r#"
-            INSERT INTO sessions (thread_ts, session_id, status, created_at, updated_at)
-            VALUES (?1, ?2, 'idle', datetime('now'), datetime('now'))
+            INSERT INTO sessions (thread_ts, session_id, workspace, status, created_at, updated_at)
+            VALUES (?1, ?2, ?3, 'idle', datetime('now'), datetime('now'))
             ON CONFLICT(thread_ts) DO UPDATE SET
               session_id = excluded.session_id,
+              workspace = excluded.workspace,
               status = 'idle',
               updated_at = datetime('now')
             "#,
-            params![thread_ts, session_id],
+            params![thread_ts, session_id, workspace],
         )?;
         Ok(())
     }
@@ -143,13 +174,15 @@ impl SessionStore for SqliteStateStore {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection
             .query_row(
-                "SELECT thread_ts, session_id, status FROM sessions WHERE thread_ts = ?1",
+                "SELECT thread_ts, session_id, workspace, status FROM sessions WHERE thread_ts = ?1",
                 params![thread_ts],
                 |row| {
-                    let status: String = row.get(2)?;
+                    let workspace: Option<String> = row.get(2)?;
+                    let status: String = row.get(3)?;
                     Ok(SessionRecord {
                         thread_ts: row.get(0)?,
                         session_id: row.get(1)?,
+                        workspace: workspace.map(PathBuf::from),
                         status: SessionStatus::from_str(&status),
                     })
                 },
@@ -202,10 +235,16 @@ impl MemorySessionStore {
 }
 
 impl SessionStore for MemorySessionStore {
-    fn save_session(&self, thread_ts: &str, session_id: &str) -> Result<(), StateError> {
+    fn save_session(
+        &self,
+        thread_ts: &str,
+        session_id: &str,
+        workspace: Option<&Path>,
+    ) -> Result<(), StateError> {
         let record = SessionRecord {
             thread_ts: thread_ts.to_owned(),
             session_id: session_id.to_owned(),
+            workspace: workspace.map(Path::to_path_buf),
             status: SessionStatus::Idle,
         };
         self.sessions
@@ -276,15 +315,60 @@ mod tests {
     #[test]
     fn sqlite_saves_and_reads_session_mapping() {
         let store = SqliteStateStore::open_in_memory().unwrap();
-        store.save_session("171.1", "session-1").unwrap();
+        store
+            .save_session("171.1", "session-1", Some(Path::new(r"C:\repo")))
+            .unwrap();
 
         assert_eq!(
             store.get_session("171.1").unwrap(),
             Some(SessionRecord {
                 thread_ts: "171.1".to_owned(),
                 session_id: "session-1".to_owned(),
+                workspace: Some(PathBuf::from(r"C:\repo")),
                 status: SessionStatus::Idle
             })
+        );
+    }
+
+    #[test]
+    fn migration_adds_workspace_column_to_existing_sessions_table() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE sessions (
+                  thread_ts   TEXT PRIMARY KEY,
+                  session_id  TEXT NOT NULL,
+                  status      TEXT NOT NULL DEFAULT 'idle',
+                  created_at  TEXT NOT NULL,
+                  updated_at  TEXT NOT NULL
+                );
+
+                CREATE TABLE processed_events (
+                  event_key   TEXT PRIMARY KEY,
+                  thread_ts   TEXT,
+                  source      TEXT NOT NULL,
+                  created_at  TEXT NOT NULL
+                );
+
+                INSERT INTO sessions (thread_ts, session_id, status, created_at, updated_at)
+                VALUES ('171.1', 'session-1', 'idle', datetime('now'), datetime('now'));
+                "#,
+            )
+            .unwrap();
+        let store = SqliteStateStore {
+            connection: Mutex::new(connection),
+        };
+
+        store.migrate().unwrap();
+
+        assert_eq!(store.get_session("171.1").unwrap().unwrap().workspace, None);
+        store
+            .save_session("171.1", "session-2", Some(Path::new(r"C:\repo")))
+            .unwrap();
+        assert_eq!(
+            store.get_session("171.1").unwrap().unwrap().workspace,
+            Some(PathBuf::from(r"C:\repo"))
         );
     }
 
@@ -300,7 +384,7 @@ mod tests {
     #[test]
     fn startup_recovery_moves_running_sessions_to_idle() {
         let store = SqliteStateStore::open_in_memory().unwrap();
-        store.save_session("171.1", "session-1").unwrap();
+        store.save_session("171.1", "session-1", None).unwrap();
         store
             .set_session_status("171.1", SessionStatus::Running)
             .unwrap();

@@ -71,6 +71,7 @@ fn parse_workspace_value(value: &str) -> Result<(Option<PathBuf>, String), Codex
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CodexSessionOutput {
     pub session_id: String,
+    pub workspace: PathBuf,
     pub stdout: String,
     pub stderr: String,
 }
@@ -87,6 +88,7 @@ pub trait CodexExecutor: Send + Sync {
     async fn resume_session(
         &self,
         session_id: &str,
+        workspace: Option<PathBuf>,
         request: CodexRequest,
     ) -> Result<CodexResumeOutput, CodexError>;
 }
@@ -210,13 +212,7 @@ impl CodexExecutor for CodexCli {
             .validate(request.workspace.as_deref())?;
         let output = run_codex(
             &self.executable,
-            vec![
-                "exec".to_owned(),
-                "--json".to_owned(),
-                "--cd".to_owned(),
-                workspace.to_string_lossy().into_owned(),
-                request.prompt,
-            ],
+            start_args(&workspace, request.prompt),
             self.timeout,
             &self.env_policy,
         )
@@ -226,6 +222,7 @@ impl CodexExecutor for CodexCli {
 
         Ok(CodexSessionOutput {
             session_id,
+            workspace,
             stdout: output.stdout,
             stderr: output.stderr,
         })
@@ -234,20 +231,17 @@ impl CodexExecutor for CodexCli {
     async fn resume_session(
         &self,
         session_id: &str,
+        workspace: Option<PathBuf>,
         request: CodexRequest,
     ) -> Result<CodexResumeOutput, CodexError> {
         if request.workspace.is_some() {
             return Err(CodexError::WorkspaceOnlyOnStart);
         }
+        let workspace = self.workspace_policy.validate(workspace.as_deref())?;
 
         let output = run_codex(
             &self.executable,
-            vec![
-                "exec".to_owned(),
-                "resume".to_owned(),
-                session_id.to_owned(),
-                request.prompt,
-            ],
+            resume_args(&workspace, session_id, request.prompt),
             self.timeout,
             &self.env_policy,
         )
@@ -259,6 +253,28 @@ impl CodexExecutor for CodexCli {
             stderr: output.stderr,
         })
     }
+}
+
+fn start_args(workspace: &Path, prompt: String) -> Vec<String> {
+    vec![
+        "exec".to_owned(),
+        "--json".to_owned(),
+        "--cd".to_owned(),
+        workspace.to_string_lossy().into_owned(),
+        prompt,
+    ]
+}
+
+fn resume_args(workspace: &Path, session_id: &str, prompt: String) -> Vec<String> {
+    vec![
+        "exec".to_owned(),
+        "--json".to_owned(),
+        "--cd".to_owned(),
+        workspace.to_string_lossy().into_owned(),
+        "resume".to_owned(),
+        session_id.to_owned(),
+        prompt,
+    ]
 }
 
 async fn run_codex(
@@ -712,6 +728,30 @@ mod tests {
         let request = CodexRequest::parse("--cd=./repo do work").unwrap();
         assert_eq!(request.workspace, Some(PathBuf::from("./repo")));
         assert_eq!(request.prompt, "do work");
+    }
+
+    #[test]
+    fn start_args_use_validated_workspace() {
+        assert_eq!(
+            start_args(Path::new(r"C:\repo"), "do work".to_owned()),
+            vec!["exec", "--json", "--cd", r"C:\repo", "do work"]
+        );
+    }
+
+    #[test]
+    fn resume_args_use_validated_workspace_before_resume_subcommand() {
+        assert_eq!(
+            resume_args(Path::new(r"C:\repo"), "session-1", "continue".to_owned()),
+            vec![
+                "exec",
+                "--json",
+                "--cd",
+                r"C:\repo",
+                "resume",
+                "session-1",
+                "continue"
+            ]
+        );
     }
 
     #[test]

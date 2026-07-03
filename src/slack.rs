@@ -12,6 +12,7 @@ use crate::{
     config::{AppConfig, SecretString},
     lifecycle::{SessionLifecycle, SlackPublisher, SlackThread},
     sessions::ProcessedEvent,
+    workspace_catalog::{is_valid_alias, WorkspaceCatalog, WorkspaceCatalogEntry},
 };
 
 const APPS_CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
@@ -319,6 +320,7 @@ pub struct SocketModeRunner {
     api: SlackApiClient,
     lifecycle: Arc<SessionLifecycle>,
     started_at: Instant,
+    workspace_catalog: WorkspaceCatalog,
 }
 
 impl SocketModeRunner {
@@ -327,12 +329,14 @@ impl SocketModeRunner {
         api: SlackApiClient,
         lifecycle: Arc<SessionLifecycle>,
         started_at: Instant,
+        workspace_catalog: WorkspaceCatalog,
     ) -> Self {
         Self {
             config,
             api,
             lifecycle,
             started_at,
+            workspace_catalog,
         }
     }
 
@@ -379,7 +383,12 @@ impl SocketModeRunner {
         }
 
         let envelope = serde_json::from_value::<SocketEnvelope>(value)?;
-        Ok(prepare_envelope(&self.config, self.started_at, envelope))
+        Ok(prepare_envelope(
+            &self.config,
+            &self.workspace_catalog,
+            self.started_at,
+            envelope,
+        ))
     }
 
     fn spawn_action(&self, action: SocketAction) {
@@ -390,6 +399,16 @@ impl SocketModeRunner {
                     command,
                     processed_event,
                 } => lifecycle.start_from_slash(command, processed_event).await,
+                SocketAction::StartCodexRequest {
+                    channel_id,
+                    user_id,
+                    request,
+                    processed_event,
+                } => {
+                    lifecycle
+                        .start_from_slash_request(&channel_id, &user_id, request, processed_event)
+                        .await
+                }
                 SocketAction::StartCodexFromMessage {
                     event,
                     processed_event,
@@ -488,6 +507,12 @@ pub enum SocketAction {
         command: SlashCommandPayload,
         processed_event: ProcessedEvent,
     },
+    StartCodexRequest {
+        channel_id: String,
+        user_id: String,
+        request: CodexRequest,
+        processed_event: ProcessedEvent,
+    },
     StartCodexFromMessage {
         event: SlackMessageEvent,
         processed_event: ProcessedEvent,
@@ -500,11 +525,12 @@ pub enum SocketAction {
 
 pub fn prepare_envelope(
     config: &AppConfig,
+    workspace_catalog: &WorkspaceCatalog,
     started_at: Instant,
     envelope: SocketEnvelope,
 ) -> PreparedSocketEvent {
     match envelope.envelope_type.as_str() {
-        "slash_commands" => prepare_slash_command(config, started_at, envelope),
+        "slash_commands" => prepare_slash_command(config, workspace_catalog, started_at, envelope),
         "events_api" => prepare_events_api(config, envelope),
         _ => PreparedSocketEvent {
             ack: Some(SocketAck {
@@ -518,13 +544,16 @@ pub fn prepare_envelope(
 
 fn prepare_slash_command(
     config: &AppConfig,
+    workspace_catalog: &WorkspaceCatalog,
     started_at: Instant,
     envelope: SocketEnvelope,
 ) -> PreparedSocketEvent {
     let event_key = slack_event_key(Some(&envelope.envelope_id), &envelope.payload)
         .unwrap_or_else(|| envelope.envelope_id.clone());
     let (response, action) = match serde_json::from_value::<SlashCommandPayload>(envelope.payload) {
-        Ok(command) => handle_slash_command(config, started_at, command, event_key),
+        Ok(command) => {
+            handle_slash_command(config, workspace_catalog, started_at, command, event_key)
+        }
         Err(error) => (
             SlackResponsePayload {
                 response_type: ResponseType::Ephemeral,
@@ -634,6 +663,7 @@ pub fn parse_message_event(payload: Value) -> Option<SlackMessageEvent> {
 
 fn handle_slash_command(
     config: &AppConfig,
+    workspace_catalog: &WorkspaceCatalog,
     started_at: Instant,
     command: SlashCommandPayload,
     event_key: String,
@@ -656,6 +686,35 @@ fn handle_slash_command(
             },
             None,
         ),
+        "/codex-list" => (
+            SlackResponsePayload {
+                response_type: ResponseType::Ephemeral,
+                text: workspace_catalog_text(&config.bot_hostname, workspace_catalog),
+            },
+            None,
+        ),
+        "/codex-select" => match parse_codex_select_request(&command.text, workspace_catalog) {
+            Ok(request) => (
+                SlackResponsePayload {
+                    response_type: ResponseType::Ephemeral,
+                    text: "Starting Codex in the selected workspace. A thread reply will appear shortly."
+                        .to_owned(),
+                },
+                Some(SocketAction::StartCodexRequest {
+                    channel_id: command.channel_id,
+                    user_id: command.user_id,
+                    request,
+                    processed_event: ProcessedEvent::new(event_key, None, "slash_commands"),
+                }),
+            ),
+            Err(error) => (
+                SlackResponsePayload {
+                    response_type: ResponseType::Ephemeral,
+                    text: error.user_message(),
+                },
+                None,
+            ),
+        },
         "/codex" => match CodexRequest::parse(command.text.trim()) {
             Ok(request) if request.prompt.is_empty() => (
                 SlackResponsePayload {
@@ -686,13 +745,88 @@ fn handle_slash_command(
             SlackResponsePayload {
                 response_type: ResponseType::Ephemeral,
                 text: format!(
-                    "Unsupported command {}. Use /codex-ping or /codex <prompt>.",
+                    "Unsupported command {}. Use /codex-ping, /codex-list, /codex <prompt>, or /codex-select <alias>.",
                     command.command
                 ),
             },
             None,
         ),
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum CodexSelectError {
+    Usage,
+    UnknownAlias(String),
+}
+
+impl CodexSelectError {
+    fn user_message(&self) -> String {
+        match self {
+            Self::Usage => {
+                "Usage: /codex-select <alias> followed by a newline and prompt.".to_owned()
+            }
+            Self::UnknownAlias(alias) => {
+                format!("Unknown workspace alias `{alias}`. Use /codex-list to see aliases for this host.")
+            }
+        }
+    }
+}
+
+fn parse_codex_select_request(
+    text: &str,
+    catalog: &WorkspaceCatalog,
+) -> Result<CodexRequest, CodexSelectError> {
+    let text = text.trim();
+    let Some((alias_line, prompt)) = text.split_once('\n') else {
+        return Err(CodexSelectError::Usage);
+    };
+    let alias = alias_line.trim();
+    if !is_valid_alias(alias) || alias.contains(char::is_whitespace) || prompt.trim().is_empty() {
+        return Err(CodexSelectError::Usage);
+    }
+    let Some(entry) = catalog.find(alias) else {
+        return Err(CodexSelectError::UnknownAlias(alias.to_owned()));
+    };
+
+    Ok(CodexRequest {
+        prompt: prompt.to_owned(),
+        workspace: Some(entry.path.clone()),
+    })
+}
+
+fn workspace_catalog_text(hostname: &str, catalog: &WorkspaceCatalog) -> String {
+    if catalog.is_empty() {
+        return format!("No workspace aliases are configured on {hostname}.");
+    }
+
+    let mut lines = vec![format!("Workspace aliases on {hostname}:")];
+    lines.extend(catalog.entries().iter().map(workspace_catalog_line));
+    lines.push(
+        "Use /codex-select <alias> on the first line, then put the prompt on following lines."
+            .to_owned(),
+    );
+    lines.join("\n")
+}
+
+fn workspace_catalog_line(entry: &WorkspaceCatalogEntry) -> String {
+    let mut line = format!("- `{}`", entry.alias);
+    if entry.is_default {
+        line.push_str(" (default)");
+    }
+    if let Some(display_name) = entry.display_name.as_deref() {
+        line.push_str(" - ");
+        line.push_str(&single_line(display_name));
+    }
+    if let Some(description) = entry.description.as_deref() {
+        line.push_str(": ");
+        line.push_str(&single_line(description));
+    }
+    line
+}
+
+fn single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn is_command_allowed(config: &AppConfig, command: &SlashCommandPayload) -> bool {
@@ -826,7 +960,20 @@ mod tests {
             child_env_allowlist: vec!["PATH".to_owned()],
             default_workspace: None,
             allowed_workspaces: vec![PathBuf::from(".")],
+            workspace_catalog_path: None,
         }
+    }
+
+    fn test_catalog() -> WorkspaceCatalog {
+        let mut slack = WorkspaceCatalogEntry::new("slack", r"C:\workspace\slack-codex");
+        slack.display_name = Some("Slack Codex".to_owned());
+        slack.description = Some("Local bridge".to_owned());
+        slack.is_default = true;
+
+        let mut docs = WorkspaceCatalogEntry::new("docs", r"C:\workspace\docs");
+        docs.display_name = Some("Docs".to_owned());
+
+        WorkspaceCatalog::from_entries(vec![slack, docs]).unwrap()
     }
 
     #[test]
@@ -845,7 +992,12 @@ mod tests {
             }),
         };
 
-        let prepared = prepare_envelope(&test_config(), started_at, envelope);
+        let prepared = prepare_envelope(
+            &test_config(),
+            &WorkspaceCatalog::default(),
+            started_at,
+            envelope,
+        );
         let ack = prepared.ack.unwrap();
 
         assert_eq!(ack.envelope_id, "E1");
@@ -870,7 +1022,12 @@ mod tests {
             }),
         };
 
-        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+        let prepared = prepare_envelope(
+            &test_config(),
+            &WorkspaceCatalog::default(),
+            Instant::now(),
+            envelope,
+        );
 
         assert!(prepared
             .ack
@@ -909,10 +1066,141 @@ mod tests {
             }),
         };
 
-        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+        let prepared = prepare_envelope(
+            &test_config(),
+            &WorkspaceCatalog::default(),
+            Instant::now(),
+            envelope,
+        );
         let text = prepared.ack.unwrap().payload.unwrap().text;
 
         assert!(text.contains("Workspace option is invalid"));
+        assert_eq!(prepared.action, None);
+    }
+
+    #[test]
+    fn codex_list_returns_public_safe_aliases() {
+        let envelope = SocketEnvelope {
+            envelope_id: "E11".to_owned(),
+            envelope_type: "slash_commands".to_owned(),
+            accepts_response_payload: true,
+            payload: serde_json::json!({
+                "team_id": "T123",
+                "channel_id": "D123",
+                "user_id": "U123",
+                "command": "/codex-list",
+                "text": ""
+            }),
+        };
+
+        let prepared = prepare_envelope(&test_config(), &test_catalog(), Instant::now(), envelope);
+        let text = prepared.ack.unwrap().payload.unwrap().text;
+
+        assert!(text.contains("Workspace aliases on desk"));
+        assert!(text.contains("`slack` (default)"));
+        assert!(text.contains("Slack Codex"));
+        assert!(text.contains("Local bridge"));
+        assert!(!text.contains(r"C:\workspace"));
+        assert_eq!(prepared.action, None);
+    }
+
+    #[test]
+    fn codex_select_queues_alias_request_and_preserves_multiline_prompt() {
+        let envelope = SocketEnvelope {
+            envelope_id: "E12".to_owned(),
+            envelope_type: "slash_commands".to_owned(),
+            accepts_response_payload: true,
+            payload: serde_json::json!({
+                "team_id": "T123",
+                "channel_id": "D123",
+                "user_id": "U123",
+                "command": "/codex-select",
+                "text": "slack\n  --workspace stays prompt text\nnext line"
+            }),
+        };
+
+        let prepared = prepare_envelope(&test_config(), &test_catalog(), Instant::now(), envelope);
+        let response = prepared.ack.unwrap().payload.unwrap();
+
+        assert!(response.text.contains("Starting Codex"));
+        assert_eq!(
+            prepared.action,
+            Some(SocketAction::StartCodexRequest {
+                channel_id: "D123".to_owned(),
+                user_id: "U123".to_owned(),
+                request: CodexRequest {
+                    prompt: "  --workspace stays prompt text\nnext line".to_owned(),
+                    workspace: Some(PathBuf::from(r"C:\workspace\slack-codex")),
+                },
+                processed_event: ProcessedEvent::new("E12", None, "slash_commands"),
+            })
+        );
+    }
+
+    #[test]
+    fn codex_select_rejects_same_line_extra_text() {
+        let envelope = SocketEnvelope {
+            envelope_id: "E13".to_owned(),
+            envelope_type: "slash_commands".to_owned(),
+            accepts_response_payload: true,
+            payload: serde_json::json!({
+                "team_id": "T123",
+                "channel_id": "D123",
+                "user_id": "U123",
+                "command": "/codex-select",
+                "text": "slack extra\nprompt"
+            }),
+        };
+
+        let prepared = prepare_envelope(&test_config(), &test_catalog(), Instant::now(), envelope);
+        let text = prepared.ack.unwrap().payload.unwrap().text;
+
+        assert!(text.contains("Usage: /codex-select"));
+        assert_eq!(prepared.action, None);
+    }
+
+    #[test]
+    fn codex_select_rejects_missing_prompt() {
+        let envelope = SocketEnvelope {
+            envelope_id: "E14".to_owned(),
+            envelope_type: "slash_commands".to_owned(),
+            accepts_response_payload: true,
+            payload: serde_json::json!({
+                "team_id": "T123",
+                "channel_id": "D123",
+                "user_id": "U123",
+                "command": "/codex-select",
+                "text": "slack"
+            }),
+        };
+
+        let prepared = prepare_envelope(&test_config(), &test_catalog(), Instant::now(), envelope);
+        let text = prepared.ack.unwrap().payload.unwrap().text;
+
+        assert!(text.contains("Usage: /codex-select"));
+        assert_eq!(prepared.action, None);
+    }
+
+    #[test]
+    fn codex_select_rejects_unknown_alias() {
+        let envelope = SocketEnvelope {
+            envelope_id: "E15".to_owned(),
+            envelope_type: "slash_commands".to_owned(),
+            accepts_response_payload: true,
+            payload: serde_json::json!({
+                "team_id": "T123",
+                "channel_id": "D123",
+                "user_id": "U123",
+                "command": "/codex-select",
+                "text": "unknown\nprompt"
+            }),
+        };
+
+        let prepared = prepare_envelope(&test_config(), &test_catalog(), Instant::now(), envelope);
+        let text = prepared.ack.unwrap().payload.unwrap().text;
+
+        assert!(text.contains("Unknown workspace alias `unknown`"));
+        assert!(text.contains("/codex-list"));
         assert_eq!(prepared.action, None);
     }
 
@@ -995,7 +1283,12 @@ mod tests {
         };
 
         assert_eq!(
-            prepare_envelope(&test_config(), Instant::now(), envelope),
+            prepare_envelope(
+                &test_config(),
+                &WorkspaceCatalog::default(),
+                Instant::now(),
+                envelope
+            ),
             PreparedSocketEvent {
                 ack: Some(SocketAck {
                     envelope_id: "E3".to_owned(),
@@ -1026,7 +1319,12 @@ mod tests {
             }),
         };
 
-        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+        let prepared = prepare_envelope(
+            &test_config(),
+            &WorkspaceCatalog::default(),
+            Instant::now(),
+            envelope,
+        );
 
         assert_eq!(
             prepared.action,
@@ -1068,7 +1366,12 @@ mod tests {
             }),
         };
 
-        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+        let prepared = prepare_envelope(
+            &test_config(),
+            &WorkspaceCatalog::default(),
+            Instant::now(),
+            envelope,
+        );
 
         assert_eq!(
             prepared.action,
@@ -1110,7 +1413,12 @@ mod tests {
             }),
         };
 
-        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+        let prepared = prepare_envelope(
+            &test_config(),
+            &WorkspaceCatalog::default(),
+            Instant::now(),
+            envelope,
+        );
 
         assert_eq!(prepared.action, None);
     }
@@ -1133,7 +1441,12 @@ mod tests {
             }),
         };
 
-        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+        let prepared = prepare_envelope(
+            &test_config(),
+            &WorkspaceCatalog::default(),
+            Instant::now(),
+            envelope,
+        );
 
         assert_eq!(prepared.action, None);
     }
@@ -1157,7 +1470,12 @@ mod tests {
             }),
         };
 
-        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+        let prepared = prepare_envelope(
+            &test_config(),
+            &WorkspaceCatalog::default(),
+            Instant::now(),
+            envelope,
+        );
 
         assert_eq!(prepared.action, None);
     }
@@ -1181,7 +1499,12 @@ mod tests {
             }),
         };
 
-        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+        let prepared = prepare_envelope(
+            &test_config(),
+            &WorkspaceCatalog::default(),
+            Instant::now(),
+            envelope,
+        );
 
         assert_eq!(prepared.action, None);
     }
@@ -1256,9 +1579,14 @@ mod tests {
             }),
         };
 
-        let ack = prepare_envelope(&test_config(), started_at, envelope)
-            .ack
-            .unwrap();
+        let ack = prepare_envelope(
+            &test_config(),
+            &WorkspaceCatalog::default(),
+            started_at,
+            envelope,
+        )
+        .ack
+        .unwrap();
         let encoded = serde_json::to_string(&ack).unwrap();
 
         assert!(!encoded.contains("xoxb-test-secret"));
@@ -1280,9 +1608,14 @@ mod tests {
             }),
         };
 
-        let ack = prepare_envelope(&test_config(), Instant::now(), envelope)
-            .ack
-            .unwrap();
+        let ack = prepare_envelope(
+            &test_config(),
+            &WorkspaceCatalog::default(),
+            Instant::now(),
+            envelope,
+        )
+        .ack
+        .unwrap();
         let text = ack.payload.unwrap().text;
 
         assert_eq!(

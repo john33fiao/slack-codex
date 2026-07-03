@@ -9,7 +9,7 @@ Slack Codex is a local bridge between Slack DM threads and local Codex sessions.
 ```text
 slack-codex
 ├── Socket Mode receiver
-├── slash command handlers: /codex, /codex-ping
+├── slash command handlers: /codex, /codex-ping, /codex-list, /codex-select
 ├── DM top-level start and thread message handler
 ├── SQLite state: sessions, processed_events
 ├── per-session execution lock
@@ -21,6 +21,7 @@ slack-codex
 
 - One Slack thread maps to one Codex session.
 - A registered thread resumes from the workspace validated when that session started.
+- Workspace aliases resolve to host-local paths before session start and still pass canonical allowed-workspace validation.
 - Top-level bot DM messages can start sessions; registered thread replies resume sessions.
 - Messages outside bot DMs never start or resume a session.
 - Unregistered thread replies never create or resume sessions.

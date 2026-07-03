@@ -10,7 +10,9 @@ v1은 단일 사용자와 수동 호스트 선택에 집중합니다. 여러 호
 
 - Slack Socket Mode 연결
 - `/codex-ping` host/uptime 응답
+- `/codex-list` host-local workspace alias 목록 응답
 - host bot DM의 top-level 일반 메시지 또는 `/codex <prompt>`로 새 Codex session 시작
+- `/codex-select <alias>`로 alias 기반 workspace 선택 후 새 Codex session 시작
 - 생성된 Slack thread와 Codex session ID 매핑
 - 같은 Slack thread의 후속 메시지를 `codex exec resume`으로 재개
 - SQLite 기반 session/event idempotency 저장
@@ -26,7 +28,7 @@ v1은 단일 사용자와 수동 호스트 선택에 집중합니다. 여러 호
 - Rust 1.75 이상과 Cargo
 - 대상 호스트에서 로그인/인증된 `codex` CLI
 - Socket Mode가 켜진 host 전용 Slack app
-- Slack slash command 2개: `/codex`, `/codex-ping`
+- Slack slash command 4개: `/codex`, `/codex-ping`, `/codex-list`, `/codex-select`
 - Slack DM message event 수신 설정
 - Slack message posting과 external file upload에 필요한 bot 권한
 - 이 바이너리가 실행할 수 있는 host-local workspace 경로
@@ -58,6 +60,7 @@ CODEX_CHILD_ENV_ALLOWLIST=HOME,PATH,USER,SHELL,CODEX_HOME,CODEX_PROFILE_ROOT,COD
 CODEX_PROFILE_ROOT='C:\path\to\codex-profile'
 CODEX_DEFAULT_WORKSPACE='C:\workspace\repo-a'
 CODEX_ALLOWED_WORKSPACES='C:\workspace\repo-a;C:\workspace\repo-b'
+# CODEX_WORKSPACE_CATALOG_PATH='.\workspaces.json'
 QUEUE_DB_PATH='.\data\sessions.db'
 
 RUST_LOG=info
@@ -73,7 +76,36 @@ RUST_LOG=info
 - `CODEX_DEFAULT_WORKSPACE`를 설정하지 않으면 `/codex`에서 workspace를 지정하지 않았을 때 바이너리의 현재 작업 디렉터리를 사용합니다. service working directory도 허용 workspace 안에 두는 편이 안전합니다.
 - 기본 workspace와 요청 workspace는 모두 `CODEX_ALLOWED_WORKSPACES` 안에 있어야 합니다.
 - 요청한 workspace와 허용 root는 canonical path로 비교합니다. 존재하지 않는 경로는 허용되지 않습니다.
+- `CODEX_WORKSPACE_CATALOG_PATH`를 설정하지 않으면 실행파일 옆 `workspaces.json`이 있을 때만 alias catalog를 로드합니다.
+- workspace alias catalog의 모든 path도 `CODEX_ALLOWED_WORKSPACES` 검증을 통과해야 합니다.
 - Slack token 변수는 `CODEX_CHILD_ENV_ALLOWLIST`에 실수로 넣어도 Codex child process로 전달되지 않습니다.
+
+## Workspace Alias Catalog
+
+Workspace alias catalog는 host-local private JSON 파일입니다. 실제 경로가 들어가므로 공개 저장소에 커밋하지 않습니다.
+
+예시:
+
+```json
+{
+  "workspaces": [
+    {
+      "alias": "slack",
+      "display_name": "Slack Codex",
+      "description": "Personal Slack bridge repo",
+      "default": true,
+      "path": "<ABSOLUTE_PATH_TO_WORKSPACE>"
+    }
+  ]
+}
+```
+
+규칙:
+
+- `alias`는 영문/숫자/`-`/`_`/`.`만 사용할 수 있고 중복될 수 없습니다.
+- `display_name`과 `description`은 `/codex-list`에 표시됩니다.
+- `path`는 실제 host에서 존재해야 하며 `CODEX_ALLOWED_WORKSPACES` 안에 있어야 합니다.
+- `default`는 `/codex-list`에서 표시만 하는 marker입니다. `/codex`의 기본 workspace는 계속 `CODEX_DEFAULT_WORKSPACE`가 결정합니다.
 
 ## 빌드와 실행
 
@@ -119,6 +151,20 @@ pong from <BOT_HOSTNAME> (uptime <seconds>s)
 README의 세팅 절차를 점검해줘
 ```
 
+현재 host bot의 workspace alias 확인:
+
+```text
+/codex-list
+```
+
+alias로 workspace를 선택해서 새 작업 시작:
+
+```text
+/codex-select slack
+README를 읽고
+다음 작업 3개를 제안해줘
+```
+
 특정 workspace에서 새 작업 시작:
 
 ```text
@@ -137,6 +183,7 @@ README의 세팅 절차를 점검해줘
 제약:
 
 - workspace 선택은 새 session을 시작할 때만 가능합니다.
+- `/codex-select`는 첫 줄에 alias만 두고, 둘째 줄부터 prompt를 적어야 합니다.
 - 등록되지 않은 thread reply나 DM 바깥 메시지는 기존 Codex session을 재개하거나 새 session을 만들지 않습니다.
 - `CODEX_OUTPUT_MAX_CHARS`보다 긴 결과는 `codex-output.txt` file upload로 게시됩니다.
 
@@ -155,11 +202,13 @@ Slack/서비스 쪽 manual smoke:
 1. host service를 시작하고 service manager에서 running 상태를 확인합니다.
 2. service restart 후 같은 `QUEUE_DB_PATH`로 다시 연결되는지 확인합니다.
 3. `/codex-ping`이 기대한 `BOT_HOSTNAME`과 uptime을 반환하는지 확인합니다.
-4. `/codex <harmless prompt>`가 하나의 parent thread와 결과 reply를 만드는지 확인합니다.
-5. 같은 thread의 후속 메시지가 같은 Codex session을 resume하는지 확인합니다.
-6. 긴 출력을 만들어 external file upload가 thread에 붙는지 확인합니다.
-7. service를 멈춘 상태에서 Slack이 어떤 실패 신호를 보이는지 기록합니다.
-8. 로그와 공유 산출물에 token, 개인 경로, session dump가 없는지 확인합니다.
+4. `/codex-list`가 alias를 표시하고 full host-local path를 노출하지 않는지 확인합니다.
+5. `/codex-select <alias>`와 multiline prompt가 하나의 parent thread와 결과 reply를 만드는지 확인합니다.
+6. `/codex <harmless prompt>`가 하나의 parent thread와 결과 reply를 만드는지 확인합니다.
+7. 같은 thread의 후속 메시지가 같은 Codex session을 resume하는지 확인합니다.
+8. 긴 출력을 만들어 external file upload가 thread에 붙는지 확인합니다.
+9. service를 멈춘 상태에서 Slack이 어떤 실패 신호를 보이는지 기록합니다.
+10. 로그와 공유 산출물에 token, 개인 경로, session dump가 없는지 확인합니다.
 
 Slack presence나 bot green-dot 상태는 workspace마다 다를 수 있으므로 readiness 근거로 단정하지 않습니다. 자세한 운영 체크리스트는 `docs/OPERATIONS.md`에 있습니다.
 
@@ -178,6 +227,7 @@ Agent instructions, repo-local skills, TODO/WBS/ticket, reference notes, and his
 - 실제 Slack team/user ID
 - Codex auth/profile 경로
 - host-local workspace 절대경로
+- workspace alias catalog의 실제 path
 - runtime SQLite DB
 - service 파일의 실제 계정명/경로
 - 로그, Slack event dump, Codex session dump

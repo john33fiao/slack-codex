@@ -98,18 +98,34 @@ impl SessionLifecycle {
         command: SlashCommandPayload,
         processed_event: ProcessedEvent,
     ) -> Result<(), LifecycleError> {
+        let request = CodexRequest::parse(command.text.trim())?;
+        self.start_from_slash_request(
+            &command.channel_id,
+            &command.user_id,
+            request,
+            processed_event,
+        )
+        .await
+    }
+
+    pub async fn start_from_slash_request(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+        request: CodexRequest,
+        processed_event: ProcessedEvent,
+    ) -> Result<(), LifecycleError> {
         if !self.sessions.try_record_event(&processed_event)? {
             return Ok(());
         }
 
-        let request = CodexRequest::parse(command.text.trim())?;
         if request.prompt.is_empty() {
             return Ok(());
         }
 
         let thread = self
             .publisher
-            .start_session_thread(&command.channel_id, &command.user_id)
+            .start_session_thread(channel_id, user_id)
             .await?;
 
         self.start_session_in_thread(thread, request).await

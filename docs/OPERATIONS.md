@@ -8,6 +8,7 @@ Each host should keep these files in a private install directory:
 
 - `slack-codex` binary or `slack-codex.exe`
 - `.env` with real Slack app tokens, allowed team/user IDs, Codex profile values, default and allowed workspaces, and DB path
+- optional `workspaces.json` or `CODEX_WORKSPACE_CATALOG_PATH` target with real workspace aliases and paths
 - runtime `sessions.db`
 - service-manager files or wrapper scripts containing real host paths
 - logs
@@ -18,6 +19,7 @@ Use `.env.example` only as a placeholder template.
 
 Use a Windows service wrapper that can set the working directory to the private install directory. The app loads `.env` from the executable directory first, then falls back to the working directory search used by `dotenvy`.
 Set `CODEX_DEFAULT_WORKSPACE` when plain DM prompts or `/codex <prompt>` should run from a workspace that is different from the service working directory.
+Set `CODEX_WORKSPACE_CATALOG_PATH` only when the alias catalog is not stored as `workspaces.json` next to the binary.
 Quote Windows paths in `.env` with single quotes because backslashes are parsed as escapes by the dotenv parser.
 Set `CODEX_CLI_PATH` to the absolute `codex.exe` path when the host service cannot find `codex` through `PATH`.
 
@@ -76,17 +78,22 @@ Run this checklist on each host-specific Slack app before calling v1 ready:
 3. Stop the host service, send `/codex-ping`, and record the observed Slack failure signal.
 4. Start the service, send `/codex-ping`, and confirm the response contains the expected host identity and uptime.
 5. Send a plain top-level harmless prompt in the host bot DM and confirm the first Codex result appears in that message's thread.
-6. Send `/codex <harmless prompt>` in the host bot DM and confirm the compatibility flow creates one parent thread.
-7. Reply in each started thread and confirm the reply resumes the same Codex session.
-8. Send a reply in an unregistered thread and confirm Codex is not run and the guide message appears.
-9. Produce output longer than `CODEX_OUTPUT_MAX_CHARS` and confirm it is attached with the external upload flow.
-10. Check logs for token/path leaks before preserving or sharing any output.
+6. Send `/codex-list` and confirm it shows aliases, display names, and default marker without full host-local paths.
+7. Send `/codex-select <alias>` followed by a multiline harmless prompt and confirm it creates one parent thread.
+8. Send `/codex-select <alias> extra text` and `/codex-select <unknown-alias>` and confirm both return ephemeral guidance without running Codex.
+9. Send `/codex <harmless prompt>` in the host bot DM and confirm the compatibility flow creates one parent thread.
+10. Reply in each started thread and confirm the reply resumes the same Codex session.
+11. Send a reply in an unregistered thread and confirm Codex is not run and the guide message appears.
+12. Produce output longer than `CODEX_OUTPUT_MAX_CHARS` and confirm it is attached with the external upload flow.
+13. Check logs for token/path leaks before preserving or sharing any output.
 
 ## Slack Signals
 
 Treat these signals as authoritative for readiness:
 
 - `/codex-ping` response from the target host bot DM
+- `/codex-list` alias list from the target host bot DM
+- `/codex-select <alias>` result thread from the selected workspace
 - service-manager running/restart status on the host
 - successful first plain-DM result in the user's message thread
 - successful `/codex` compatibility result in the created thread

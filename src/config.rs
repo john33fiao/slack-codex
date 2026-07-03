@@ -37,6 +37,7 @@ pub struct AppConfig {
     pub child_env_allowlist: Vec<String>,
     pub default_workspace: Option<PathBuf>,
     pub allowed_workspaces: Vec<PathBuf>,
+    pub workspace_catalog_path: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -73,6 +74,8 @@ impl AppConfig {
         let allowed_workspaces = optional_string(&mut lookup, "CODEX_ALLOWED_WORKSPACES")
             .map(|value| split_path_list(&value))
             .unwrap_or_default();
+        let workspace_catalog_path =
+            optional_string(&mut lookup, "CODEX_WORKSPACE_CATALOG_PATH").map(PathBuf::from);
 
         Ok(Self {
             slack_bot_token,
@@ -87,6 +90,7 @@ impl AppConfig {
             child_env_allowlist,
             default_workspace,
             allowed_workspaces,
+            workspace_catalog_path,
         })
     }
 }
@@ -218,6 +222,10 @@ mod tests {
             ),
             ("CODEX_DEFAULT_WORKSPACE".to_owned(), "./a".to_owned()),
             ("CODEX_ALLOWED_WORKSPACES".to_owned(), "./a;./b".to_owned()),
+            (
+                "CODEX_WORKSPACE_CATALOG_PATH".to_owned(),
+                "./workspaces.json".to_owned(),
+            ),
         ]);
 
         let config = AppConfig::from_map(&values).unwrap();
@@ -244,6 +252,10 @@ mod tests {
         assert_eq!(
             config.allowed_workspaces,
             vec![PathBuf::from("./a"), PathBuf::from("./b")]
+        );
+        assert_eq!(
+            config.workspace_catalog_path,
+            Some(PathBuf::from("./workspaces.json"))
         );
     }
 

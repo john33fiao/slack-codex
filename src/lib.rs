@@ -3,14 +3,21 @@ pub mod config;
 pub mod lifecycle;
 pub mod sessions;
 pub mod slack;
+pub mod workspace_catalog;
 
-use std::{env, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 use codex::{ChildEnvPolicy, CodexCli, WorkspacePolicy};
 use config::AppConfig;
 use lifecycle::SessionLifecycle;
 use sessions::{SessionStore, SqliteStateStore};
 use slack::{SlackApiClient, SocketModeRunner};
+use workspace_catalog::{WorkspaceCatalog, DEFAULT_WORKSPACE_CATALOG_FILENAME};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -22,6 +29,8 @@ pub enum AppError {
     Slack(#[from] slack::SlackError),
     #[error(transparent)]
     Codex(#[from] codex::CodexError),
+    #[error(transparent)]
+    WorkspaceCatalog(#[from] workspace_catalog::WorkspaceCatalogError),
 }
 
 pub async fn run() -> Result<(), AppError> {
@@ -34,12 +43,17 @@ pub async fn run() -> Result<(), AppError> {
         config.allowed_workspaces.clone(),
         config.default_workspace.clone(),
     );
+    let workspace_catalog_path = workspace_catalog_path(config.workspace_catalog_path.as_deref());
+    let workspace_catalog = WorkspaceCatalog::load_optional(workspace_catalog_path.as_deref())?;
+    workspace_catalog.validate_paths(&workspace_policy)?;
     tracing::info!(
         host = %config.bot_hostname,
         dotenv_from_exe_dir = dotenv_load.exe_dir,
         dotenv_from_cwd_search = dotenv_load.cwd_search,
         default_workspace_configured = config.default_workspace.is_some(),
         allowed_workspace_count = config.allowed_workspaces.len(),
+        workspace_catalog_configured = workspace_catalog_path.is_some(),
+        workspace_alias_count = workspace_catalog.entries().len(),
         "loaded slack-codex config"
     );
     if config.default_workspace.is_some() {
@@ -65,10 +79,22 @@ pub async fn run() -> Result<(), AppError> {
         sessions,
         config.codex_output_max_chars,
     );
-    let runner = SocketModeRunner::new(config, api, lifecycle, Instant::now());
+    let runner = SocketModeRunner::new(config, api, lifecycle, Instant::now(), workspace_catalog);
     runner.run().await?;
 
     Ok(())
+}
+
+fn workspace_catalog_path(configured: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = configured {
+        return Some(path.to_path_buf());
+    }
+
+    let path = env::current_exe()
+        .ok()
+        .and_then(|exe_path| exe_path.parent().map(Path::to_path_buf))?
+        .join(DEFAULT_WORKSPACE_CATALOG_FILENAME);
+    path.is_file().then_some(path)
 }
 
 #[derive(Debug, Default)]

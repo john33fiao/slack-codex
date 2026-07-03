@@ -112,6 +112,41 @@ impl SessionLifecycle {
             .start_session_thread(&command.channel_id, &command.user_id)
             .await?;
 
+        self.start_session_in_thread(thread, request).await
+    }
+
+    pub async fn start_from_message(
+        &self,
+        event: SlackMessageEvent,
+        processed_event: ProcessedEvent,
+    ) -> Result<(), LifecycleError> {
+        if !self.sessions.try_record_event(&processed_event)? {
+            return Ok(());
+        }
+
+        let request = match CodexRequest::parse(event.text.trim()) {
+            Ok(request) if request.prompt.is_empty() => return Ok(()),
+            Ok(request) => request,
+            Err(error) => {
+                self.publisher
+                    .post_thread_message(&event.channel, &event.ts, &error.user_message())
+                    .await?;
+                return Err(error.into());
+            }
+        };
+        let thread = SlackThread {
+            channel_id: event.channel,
+            thread_ts: event.ts,
+        };
+
+        self.start_session_in_thread(thread, request).await
+    }
+
+    async fn start_session_in_thread(
+        &self,
+        thread: SlackThread,
+        request: CodexRequest,
+    ) -> Result<(), LifecycleError> {
         match self.codex.start_session(request).await {
             Ok(output) => {
                 self.sessions.save_session(
@@ -158,7 +193,7 @@ impl SessionLifecycle {
                 .post_thread_message(
                     &event.channel,
                     thread_ts,
-                    "This thread is not registered with a Codex session. Start with `/codex <prompt>`.",
+                    "This thread is not registered with a Codex session. Start with a top-level DM message or `/codex <prompt>`.",
                 )
                 .await?;
             return Ok(());
@@ -394,6 +429,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn top_level_message_starts_session_in_user_message_thread() {
+        let codex = Arc::new(FakeCodex::default());
+        let publisher = Arc::new(FakePublisher::default());
+        let sessions = MemorySessionStore::shared();
+        let lifecycle =
+            SessionLifecycle::new(codex.clone(), publisher.clone(), sessions.clone(), 1000);
+
+        lifecycle
+            .start_from_message(
+                SlackMessageEvent {
+                    channel: "D1".to_owned(),
+                    channel_type: Some("im".to_owned()),
+                    team: Some("T1".to_owned()),
+                    user: Some("U1".to_owned()),
+                    text: "plain request".to_owned(),
+                    ts: "171.0002".to_owned(),
+                    thread_ts: None,
+                },
+                ProcessedEvent::new("E2", Some("171.0002".to_owned()), "events_api"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(codex.starts.lock().unwrap().as_slice(), ["plain request"]);
+        assert_eq!(
+            sessions
+                .get_session("171.0002")
+                .unwrap()
+                .unwrap()
+                .session_id,
+            "session-1".to_owned()
+        );
+        assert!(publisher
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, thread_ts, text)| thread_ts == "171.0002" && text == "started output"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_top_level_message_event_does_not_start_twice() {
+        let codex = Arc::new(FakeCodex::default());
+        let publisher = Arc::new(FakePublisher::default());
+        let sessions = MemorySessionStore::shared();
+        let lifecycle = SessionLifecycle::new(codex.clone(), publisher, sessions, 1000);
+        let event = SlackMessageEvent {
+            channel: "D1".to_owned(),
+            channel_type: Some("im".to_owned()),
+            team: Some("T1".to_owned()),
+            user: Some("U1".to_owned()),
+            text: "plain request".to_owned(),
+            ts: "171.0002".to_owned(),
+            thread_ts: None,
+        };
+        let processed_event = ProcessedEvent::new("E2", Some("171.0002".to_owned()), "events_api");
+
+        lifecycle
+            .start_from_message(event.clone(), processed_event.clone())
+            .await
+            .unwrap();
+        lifecycle
+            .start_from_message(event, processed_event)
+            .await
+            .unwrap();
+
+        assert_eq!(codex.starts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn registered_thread_resumes_same_session() {
         let codex = Arc::new(FakeCodex::default());
         let publisher = Arc::new(FakePublisher::default());
@@ -407,6 +512,8 @@ mod tests {
             .resume_from_message(
                 SlackMessageEvent {
                     channel: "D1".to_owned(),
+                    channel_type: Some("im".to_owned()),
+                    team: Some("T1".to_owned()),
                     user: Some("U1".to_owned()),
                     text: "continue".to_owned(),
                     ts: "171.0002".to_owned(),
@@ -449,6 +556,8 @@ mod tests {
         ));
         let event = SlackMessageEvent {
             channel: "D1".to_owned(),
+            channel_type: Some("im".to_owned()),
+            team: Some("T1".to_owned()),
             user: Some("U1".to_owned()),
             text: "continue".to_owned(),
             ts: "171.0002".to_owned(),
@@ -476,6 +585,8 @@ mod tests {
             .resume_from_message(
                 SlackMessageEvent {
                     channel: "D1".to_owned(),
+                    channel_type: Some("im".to_owned()),
+                    team: Some("T1".to_owned()),
                     user: Some("U1".to_owned()),
                     text: "hello".to_owned(),
                     ts: "171.0002".to_owned(),

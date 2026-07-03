@@ -1,6 +1,6 @@
 # Slack Codex
 
-Slack Codex는 개인용 Slack DM을 로컬 Codex 비동기 작업 콘솔로 쓰기 위한 Rust 단일 바이너리입니다. Slack에서 `/codex`를 보내면 이 호스트의 Codex CLI가 실행되고, 결과는 같은 Slack thread로 돌아옵니다.
+Slack Codex는 개인용 Slack DM을 로컬 Codex 비동기 작업 콘솔로 쓰기 위한 Rust 단일 바이너리입니다. Slack에서 host bot DM에 메시지를 보내면 이 호스트의 Codex CLI가 실행되고, 결과는 같은 Slack thread로 돌아옵니다.
 
 v1은 단일 사용자와 수동 호스트 선택에 집중합니다. 여러 호스트를 쓰는 경우 호스트마다 별도 Slack app/bot을 만들고, 사용자는 원하는 호스트의 bot DM을 직접 선택합니다.
 
@@ -10,7 +10,7 @@ v1은 단일 사용자와 수동 호스트 선택에 집중합니다. 여러 호
 
 - Slack Socket Mode 연결
 - `/codex-ping` host/uptime 응답
-- `/codex <prompt>` 새 Codex session 시작
+- host bot DM의 top-level 일반 메시지 또는 `/codex <prompt>`로 새 Codex session 시작
 - 생성된 Slack thread와 Codex session ID 매핑
 - 같은 Slack thread의 후속 메시지를 `codex exec resume`으로 재개
 - SQLite 기반 session/event idempotency 저장
@@ -116,17 +116,19 @@ pong from <BOT_HOSTNAME> (uptime <seconds>s)
 새 Codex 작업 시작:
 
 ```text
-/codex README의 세팅 절차를 점검해줘
+README의 세팅 절차를 점검해줘
 ```
 
 특정 workspace에서 새 작업 시작:
 
 ```text
+--workspace C:\workspace\repo-a README를 최신화해줘
+--cd=C:\workspace\repo-a cargo test 실패 원인을 찾아줘
 /codex --workspace C:\workspace\repo-a README를 최신화해줘
 /codex --cd=C:\workspace\repo-a cargo test 실패 원인을 찾아줘
 ```
 
-첫 `/codex` 요청은 parent message를 만들고, Codex 결과는 그 message의 thread에 게시됩니다. 이후 같은 작업을 이어가려면 그 thread 안에서 일반 메시지로 답하면 됩니다.
+첫 top-level DM 메시지는 그 자체가 parent message가 되고, Codex 결과는 그 message의 thread에 게시됩니다. `/codex` 요청은 호환을 위해 parent message를 만들어 같은 방식으로 결과를 게시합니다. 이후 같은 작업을 이어가려면 그 thread 안에서 일반 메시지로 답하면 됩니다.
 
 ```text
 좋아. 이제 실패한 테스트만 고쳐줘
@@ -134,8 +136,8 @@ pong from <BOT_HOSTNAME> (uptime <seconds>s)
 
 제약:
 
-- workspace 선택은 새 `/codex` session을 시작할 때만 가능합니다.
-- 등록되지 않은 thread나 DM 바깥 메시지는 기존 Codex session을 재개하지 않습니다.
+- workspace 선택은 새 session을 시작할 때만 가능합니다.
+- 등록되지 않은 thread reply나 DM 바깥 메시지는 기존 Codex session을 재개하거나 새 session을 만들지 않습니다.
 - `CODEX_OUTPUT_MAX_CHARS`보다 긴 결과는 `codex-output.txt` file upload로 게시됩니다.
 
 ## 운영 smoke test

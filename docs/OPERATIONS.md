@@ -17,7 +17,7 @@ Use `.env.example` only as a placeholder template.
 ## Windows Service Registration
 
 Use a Windows service wrapper that can set the working directory to the private install directory. The app loads `.env` from the executable directory first, then falls back to the working directory search used by `dotenvy`.
-Set `CODEX_DEFAULT_WORKSPACE` when `/codex <prompt>` should run from a workspace that is different from the service working directory.
+Set `CODEX_DEFAULT_WORKSPACE` when plain DM prompts or `/codex <prompt>` should run from a workspace that is different from the service working directory.
 Quote Windows paths in `.env` with single quotes because backslashes are parsed as escapes by the dotenv parser.
 Set `CODEX_CLI_PATH` to the absolute `codex.exe` path when the host service cannot find `codex` through `PATH`.
 
@@ -75,10 +75,10 @@ Run this checklist on each host-specific Slack app before calling v1 ready:
 2. Restart the host service and confirm it reconnects without creating a new runtime DB path.
 3. Stop the host service, send `/codex-ping`, and record the observed Slack failure signal.
 4. Start the service, send `/codex-ping`, and confirm the response contains the expected host identity and uptime.
-5. Send `/codex <harmless prompt>` in the host bot DM and confirm one parent thread is created.
-6. Confirm the first Codex result appears in that thread.
-7. Reply in the same thread and confirm the reply resumes the same Codex session.
-8. Send a message outside a registered thread and confirm Codex is not run and the guide message appears.
+5. Send a plain top-level harmless prompt in the host bot DM and confirm the first Codex result appears in that message's thread.
+6. Send `/codex <harmless prompt>` in the host bot DM and confirm the compatibility flow creates one parent thread.
+7. Reply in each started thread and confirm the reply resumes the same Codex session.
+8. Send a reply in an unregistered thread and confirm Codex is not run and the guide message appears.
 9. Produce output longer than `CODEX_OUTPUT_MAX_CHARS` and confirm it is attached with the external upload flow.
 10. Check logs for token/path leaks before preserving or sharing any output.
 
@@ -88,7 +88,8 @@ Treat these signals as authoritative for readiness:
 
 - `/codex-ping` response from the target host bot DM
 - service-manager running/restart status on the host
-- successful first `/codex` result in the created thread
+- successful first plain-DM result in the user's message thread
+- successful `/codex` compatibility result in the created thread
 - successful thread reply resume in the same thread
 
 Treat these as non-authoritative unless verified in the target workspace:

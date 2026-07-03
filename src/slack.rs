@@ -390,6 +390,10 @@ impl SocketModeRunner {
                     command,
                     processed_event,
                 } => lifecycle.start_from_slash(command, processed_event).await,
+                SocketAction::StartCodexFromMessage {
+                    event,
+                    processed_event,
+                } => lifecycle.start_from_message(event, processed_event).await,
                 SocketAction::ResumeCodex {
                     event,
                     processed_event,
@@ -427,6 +431,10 @@ pub struct SlashCommandPayload {
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
 pub struct SlackMessageEvent {
     pub channel: String,
+    #[serde(default)]
+    pub channel_type: Option<String>,
+    #[serde(default)]
+    pub team: Option<String>,
     pub user: Option<String>,
     #[serde(default)]
     pub text: String,
@@ -437,6 +445,15 @@ pub struct SlackMessageEvent {
 impl SlackMessageEvent {
     pub fn thread_ts(&self) -> &str {
         self.thread_ts.as_deref().unwrap_or(&self.ts)
+    }
+
+    fn is_top_level(&self) -> bool {
+        self.thread_ts.is_none()
+    }
+
+    fn is_direct_message(&self) -> bool {
+        self.channel_type.as_deref() == Some("im")
+            || (self.channel_type.is_none() && self.channel.starts_with('D'))
     }
 }
 
@@ -471,6 +488,10 @@ pub enum SocketAction {
         command: SlashCommandPayload,
         processed_event: ProcessedEvent,
     },
+    StartCodexFromMessage {
+        event: SlackMessageEvent,
+        processed_event: ProcessedEvent,
+    },
     ResumeCodex {
         event: SlackMessageEvent,
         processed_event: ProcessedEvent,
@@ -484,7 +505,7 @@ pub fn prepare_envelope(
 ) -> PreparedSocketEvent {
     match envelope.envelope_type.as_str() {
         "slash_commands" => prepare_slash_command(config, started_at, envelope),
-        "events_api" => prepare_events_api(envelope),
+        "events_api" => prepare_events_api(config, envelope),
         _ => PreparedSocketEvent {
             ack: Some(SocketAck {
                 envelope_id: envelope.envelope_id,
@@ -526,16 +547,30 @@ fn prepare_slash_command(
     }
 }
 
-fn prepare_events_api(envelope: SocketEnvelope) -> PreparedSocketEvent {
+fn prepare_events_api(config: &AppConfig, envelope: SocketEnvelope) -> PreparedSocketEvent {
     let event_key = slack_event_key(Some(&envelope.envelope_id), &envelope.payload)
         .unwrap_or_else(|| envelope.envelope_id.clone());
-    let action = parse_message_event(envelope.payload).map(|event| SocketAction::ResumeCodex {
-        processed_event: ProcessedEvent::new(
-            event_key,
-            Some(event.thread_ts().to_owned()),
-            "events_api",
-        ),
-        event,
+    let action = parse_message_event(envelope.payload).and_then(|event| {
+        if !is_message_event_allowed(config, &event)
+            || !event.is_direct_message()
+            || event.text.trim().is_empty()
+        {
+            return None;
+        }
+
+        let processed_event =
+            ProcessedEvent::new(event_key, Some(event.thread_ts().to_owned()), "events_api");
+        if event.is_top_level() {
+            Some(SocketAction::StartCodexFromMessage {
+                event,
+                processed_event,
+            })
+        } else {
+            Some(SocketAction::ResumeCodex {
+                event,
+                processed_event,
+            })
+        }
     });
 
     PreparedSocketEvent {
@@ -581,7 +616,20 @@ pub fn parse_message_event(payload: Value) -> Option<SlackMessageEvent> {
         return None;
     }
 
-    serde_json::from_value::<SlackMessageEvent>(event.clone()).ok()
+    let mut event = event.clone();
+    if let Value::Object(fields) = &mut event {
+        if !fields.contains_key("team") {
+            if let Some(team) = payload
+                .get("team_id")
+                .or_else(|| payload.get("team"))
+                .cloned()
+            {
+                fields.insert("team".to_owned(), team);
+            }
+        }
+    }
+
+    serde_json::from_value::<SlackMessageEvent>(event).ok()
 }
 
 fn handle_slash_command(
@@ -655,6 +703,19 @@ fn is_command_allowed(config: &AppConfig, command: &SlashCommandPayload) -> bool
         .unwrap_or(true)
         && (config.allowed_user_ids.is_empty()
             || config.allowed_user_ids.contains(&command.user_id))
+}
+
+fn is_message_event_allowed(config: &AppConfig, event: &SlackMessageEvent) -> bool {
+    let Some(user_id) = event.user.as_ref() else {
+        return false;
+    };
+
+    config
+        .allowed_team_id
+        .as_ref()
+        .map(|team_id| event.team.as_ref() == Some(team_id))
+        .unwrap_or(true)
+        && (config.allowed_user_ids.is_empty() || config.allowed_user_ids.contains(user_id))
 }
 
 pub fn ping_text(hostname: &str, started_at: Instant) -> String {
@@ -952,9 +1013,11 @@ mod tests {
             envelope_type: "events_api".to_owned(),
             accepts_response_payload: false,
             payload: serde_json::json!({
+                "team_id": "T123",
                 "event": {
                     "type": "message",
                     "channel": "D123",
+                    "channel_type": "im",
                     "user": "U123",
                     "text": "continue",
                     "ts": "171.0002",
@@ -975,6 +1038,8 @@ mod tests {
                 ),
                 event: SlackMessageEvent {
                     channel: "D123".to_owned(),
+                    channel_type: Some("im".to_owned()),
+                    team: Some("T123".to_owned()),
                     user: Some("U123".to_owned()),
                     text: "continue".to_owned(),
                     ts: "171.0002".to_owned(),
@@ -982,6 +1047,143 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn top_level_dm_message_queues_start_action() {
+        let envelope = SocketEnvelope {
+            envelope_id: "E4A".to_owned(),
+            envelope_type: "events_api".to_owned(),
+            accepts_response_payload: false,
+            payload: serde_json::json!({
+                "team_id": "T123",
+                "event": {
+                    "type": "message",
+                    "channel": "D123",
+                    "channel_type": "im",
+                    "user": "U123",
+                    "text": "do work",
+                    "ts": "171.0002"
+                }
+            }),
+        };
+
+        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+
+        assert_eq!(
+            prepared.action,
+            Some(SocketAction::StartCodexFromMessage {
+                processed_event: ProcessedEvent::new(
+                    "E4A",
+                    Some("171.0002".to_owned()),
+                    "events_api"
+                ),
+                event: SlackMessageEvent {
+                    channel: "D123".to_owned(),
+                    channel_type: Some("im".to_owned()),
+                    team: Some("T123".to_owned()),
+                    user: Some("U123".to_owned()),
+                    text: "do work".to_owned(),
+                    ts: "171.0002".to_owned(),
+                    thread_ts: None
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn disallowed_message_event_is_ignored() {
+        let envelope = SocketEnvelope {
+            envelope_id: "E4B".to_owned(),
+            envelope_type: "events_api".to_owned(),
+            accepts_response_payload: false,
+            payload: serde_json::json!({
+                "team_id": "T123",
+                "event": {
+                    "type": "message",
+                    "channel": "D123",
+                    "channel_type": "im",
+                    "user": "U999",
+                    "text": "do work",
+                    "ts": "171.0002"
+                }
+            }),
+        };
+
+        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+
+        assert_eq!(prepared.action, None);
+    }
+
+    #[test]
+    fn message_event_without_allowed_team_is_ignored() {
+        let envelope = SocketEnvelope {
+            envelope_id: "E4C".to_owned(),
+            envelope_type: "events_api".to_owned(),
+            accepts_response_payload: false,
+            payload: serde_json::json!({
+                "event": {
+                    "type": "message",
+                    "channel": "D123",
+                    "channel_type": "im",
+                    "user": "U123",
+                    "text": "do work",
+                    "ts": "171.0002"
+                }
+            }),
+        };
+
+        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+
+        assert_eq!(prepared.action, None);
+    }
+
+    #[test]
+    fn non_dm_message_event_is_ignored() {
+        let envelope = SocketEnvelope {
+            envelope_id: "E4D".to_owned(),
+            envelope_type: "events_api".to_owned(),
+            accepts_response_payload: false,
+            payload: serde_json::json!({
+                "team_id": "T123",
+                "event": {
+                    "type": "message",
+                    "channel": "C123",
+                    "channel_type": "channel",
+                    "user": "U123",
+                    "text": "do work",
+                    "ts": "171.0002"
+                }
+            }),
+        };
+
+        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+
+        assert_eq!(prepared.action, None);
+    }
+
+    #[test]
+    fn empty_top_level_message_event_is_ignored() {
+        let envelope = SocketEnvelope {
+            envelope_id: "E4E".to_owned(),
+            envelope_type: "events_api".to_owned(),
+            accepts_response_payload: false,
+            payload: serde_json::json!({
+                "team_id": "T123",
+                "event": {
+                    "type": "message",
+                    "channel": "D123",
+                    "channel_type": "im",
+                    "user": "U123",
+                    "text": "   ",
+                    "ts": "171.0002"
+                }
+            }),
+        };
+
+        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+
+        assert_eq!(prepared.action, None);
     }
 
     #[test]

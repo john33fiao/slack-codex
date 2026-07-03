@@ -343,7 +343,8 @@ pub fn display_output(stdout: &str) -> String {
     if trimmed.is_empty() {
         return "Codex completed without text output.".to_owned();
     }
-    redact_sensitive_text(trimmed)
+    let rendered = render_codex_jsonl_output(trimmed).unwrap_or_else(|| trimmed.to_owned());
+    redact_sensitive_text(&rendered)
 }
 
 pub fn redact_sensitive_text(value: &str) -> String {
@@ -358,6 +359,146 @@ pub fn redact_sensitive_text(value: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_codex_jsonl_output(jsonl: &str) -> Option<String> {
+    let mut saw_json = false;
+    let mut display_id = None;
+    let mut assistant_text = None;
+    let mut usage = None;
+
+    for line in jsonl.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        saw_json = true;
+
+        if display_id.is_none() {
+            display_id = find_string_key(&value, "thread_id")
+                .or_else(|| find_string_key(&value, "session_id"));
+        }
+
+        if is_event_type(&value, "item.completed") {
+            if let Some(text) = value
+                .get("item")
+                .and_then(extract_agent_message_text)
+                .filter(|text| !text.trim().is_empty())
+            {
+                assistant_text = Some(text);
+            }
+        }
+
+        if is_event_type(&value, "turn.completed") {
+            usage = value.get("usage").and_then(extract_token_usage).or(usage);
+        }
+    }
+
+    if !saw_json || (display_id.is_none() && assistant_text.is_none() && usage.is_none()) {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if let Some(display_id) = display_id {
+        parts.push(display_id);
+    }
+    parts.push(
+        assistant_text.unwrap_or_else(|| "Codex completed without assistant text.".to_owned()),
+    );
+    if let Some(usage) = usage {
+        parts.push(format!(
+            "_tokens: in {} / out {}_",
+            format_token_count(usage.input),
+            format_token_count(usage.output)
+        ));
+    }
+
+    Some(parts.join("\n\n"))
+}
+
+fn is_event_type(value: &Value, expected: &str) -> bool {
+    value.get("type").and_then(Value::as_str) == Some(expected)
+}
+
+fn extract_agent_message_text(item: &Value) -> Option<String> {
+    let is_agent_message = item.get("type").and_then(Value::as_str) == Some("agent_message")
+        || item.get("role").and_then(Value::as_str) == Some("assistant");
+    if !is_agent_message {
+        return None;
+    }
+
+    string_field(item, "text")
+        .or_else(|| string_field(item, "message"))
+        .or_else(|| item.get("content").and_then(extract_content_text))
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn extract_content_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => non_empty_text(text),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(extract_content_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            non_empty_text(&text)
+        }
+        Value::Object(_) => string_field(value, "text").or_else(|| string_field(value, "content")),
+        _ => None,
+    }
+}
+
+fn non_empty_text(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_owned())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct TokenUsage {
+    input: u64,
+    output: u64,
+}
+
+fn extract_token_usage(value: &Value) -> Option<TokenUsage> {
+    Some(TokenUsage {
+        input: number_field(
+            value,
+            &["input_tokens", "prompt_tokens", "total_input_tokens"],
+        )?,
+        output: number_field(
+            value,
+            &["output_tokens", "completion_tokens", "total_output_tokens"],
+        )?,
+    })
+}
+
+fn number_field(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_u64))
+}
+
+fn format_token_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut reversed = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            reversed.push(',');
+        }
+        reversed.push(ch);
+    }
+    reversed.chars().rev().collect()
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -588,5 +729,46 @@ mod tests {
             display_output(output),
             "ok\n[redacted sensitive output line]\nstill ok"
         );
+    }
+
+    #[test]
+    fn display_output_renders_codex_jsonl_as_slack_text() {
+        let output = r#"{"type":"thread.started","thread_id":"019f2599-235d"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","text":"테스트 확인됐어요. 잘 연결되어 있습니다."}}
+{"type":"turn.completed","usage":{"input_tokens":26265,"output_tokens":119}}"#;
+
+        assert_eq!(
+            display_output(output),
+            "019f2599-235d\n\n테스트 확인됐어요. 잘 연결되어 있습니다.\n\n_tokens: in 26,265 / out 119_"
+        );
+    }
+
+    #[test]
+    fn display_output_renders_jsonl_without_usage() {
+        let output = r#"{"type":"thread.started","thread_id":"019f2599-235d"}
+{"type":"item.completed","item":{"type":"agent_message","text":"done"}}"#;
+
+        assert_eq!(display_output(output), "019f2599-235d\n\ndone");
+    }
+
+    #[test]
+    fn display_output_uses_completion_text_when_agent_message_is_missing() {
+        let output = r#"{"type":"thread.started","thread_id":"019f2599-235d"}
+{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}"#;
+
+        assert_eq!(
+            display_output(output),
+            "019f2599-235d\n\nCodex completed without assistant text.\n\n_tokens: in 10 / out 2_"
+        );
+    }
+
+    #[test]
+    fn display_output_uses_last_agent_message() {
+        let output = r#"{"type":"thread.started","thread_id":"019f2599-235d"}
+{"type":"item.completed","item":{"type":"agent_message","text":"draft"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"final"}}"#;
+
+        assert_eq!(display_output(output), "019f2599-235d\n\nfinal");
     }
 }

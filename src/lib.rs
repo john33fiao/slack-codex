@@ -1,9 +1,15 @@
+pub mod codex;
 pub mod config;
+pub mod lifecycle;
+pub mod sessions;
 pub mod slack;
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
+use codex::CodexCli;
 use config::AppConfig;
+use lifecycle::SessionLifecycle;
+use sessions::MemorySessionStore;
 use slack::{SlackApiClient, SocketModeRunner};
 
 #[derive(Debug, thiserror::Error)]
@@ -25,7 +31,10 @@ pub async fn run() -> Result<(), AppError> {
         config.slack_bot_token.clone(),
         config.slack_app_token.clone(),
     );
-    let runner = SocketModeRunner::new(config, api, Instant::now());
+    let sessions = MemorySessionStore::shared();
+    let codex = CodexCli::shared(config.max_session_timeout_secs);
+    let lifecycle = SessionLifecycle::shared(codex, Arc::new(api.clone()), sessions);
+    let runner = SocketModeRunner::new(config, api, lifecycle, Instant::now());
     runner.run().await?;
 
     Ok(())

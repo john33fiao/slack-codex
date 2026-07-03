@@ -1,13 +1,18 @@
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
+use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::config::{AppConfig, SecretString};
+use crate::{
+    config::{AppConfig, SecretString},
+    lifecycle::{SessionLifecycle, SlackPublisher, SlackThread},
+};
 
 const APPS_CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
+const CHAT_POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
 
 #[derive(Clone)]
 pub struct SlackApiClient {
@@ -46,8 +51,75 @@ impl SlackApiClient {
         }
     }
 
-    pub fn bot_token(&self) -> &SecretString {
-        &self.bot_token
+    pub async fn post_message(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        text: &str,
+    ) -> Result<PostedMessage, SlackError> {
+        let request = ChatPostMessageRequest {
+            channel,
+            thread_ts,
+            text,
+            unfurl_links: false,
+            unfurl_media: false,
+        };
+        let response = self
+            .http
+            .post(CHAT_POST_MESSAGE_URL)
+            .bearer_auth(self.bot_token.expose())
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ChatPostMessageResponse>()
+            .await?;
+
+        if response.ok {
+            Ok(PostedMessage {
+                channel: response
+                    .channel
+                    .ok_or(SlackError::MissingField("channel"))?,
+                ts: response.ts.ok_or(SlackError::MissingField("ts"))?,
+            })
+        } else {
+            Err(SlackError::Api {
+                method: "chat.postMessage",
+                error: response.error.unwrap_or_else(|| "unknown_error".to_owned()),
+            })
+        }
+    }
+}
+
+#[async_trait]
+impl SlackPublisher for SlackApiClient {
+    async fn start_session_thread(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+    ) -> Result<SlackThread, SlackError> {
+        let posted = self
+            .post_message(
+                channel_id,
+                None,
+                &format!("Codex task started for <@{user_id}>."),
+            )
+            .await?;
+
+        Ok(SlackThread {
+            channel_id: posted.channel,
+            thread_ts: posted.ts,
+        })
+    }
+
+    async fn post_thread_message(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        text: &str,
+    ) -> Result<(), SlackError> {
+        self.post_message(channel_id, Some(thread_ts), text).await?;
+        Ok(())
     }
 }
 
@@ -58,17 +130,48 @@ struct OpenConnectionResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct ChatPostMessageRequest<'a> {
+    channel: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread_ts: Option<&'a str>,
+    text: &'a str,
+    unfurl_links: bool,
+    unfurl_media: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatPostMessageResponse {
+    ok: bool,
+    channel: Option<String>,
+    ts: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PostedMessage {
+    pub channel: String,
+    pub ts: String,
+}
+
 pub struct SocketModeRunner {
     config: AppConfig,
     api: SlackApiClient,
+    lifecycle: Arc<SessionLifecycle>,
     started_at: Instant,
 }
 
 impl SocketModeRunner {
-    pub fn new(config: AppConfig, api: SlackApiClient, started_at: Instant) -> Self {
+    pub fn new(
+        config: AppConfig,
+        api: SlackApiClient,
+        lifecycle: Arc<SessionLifecycle>,
+        started_at: Instant,
+    ) -> Self {
         Self {
             config,
             api,
+            lifecycle,
             started_at,
         }
     }
@@ -84,10 +187,14 @@ impl SocketModeRunner {
             let message = message?;
             match message {
                 Message::Text(text) => {
-                    if let Some(ack) = self.handle_socket_text(&text)? {
+                    let prepared = self.prepare_socket_text(&text)?;
+                    if let Some(ack) = prepared.ack {
                         stream
                             .send(Message::Text(serde_json::to_string(&ack)?))
                             .await?;
+                    }
+                    if let Some(action) = prepared.action {
+                        self.spawn_action(action);
                     }
                 }
                 Message::Close(frame) => {
@@ -104,15 +211,29 @@ impl SocketModeRunner {
         Ok(())
     }
 
-    fn handle_socket_text(&self, text: &str) -> Result<Option<SocketAck>, SlackError> {
+    fn prepare_socket_text(&self, text: &str) -> Result<PreparedSocketEvent, SlackError> {
         let value = serde_json::from_str::<Value>(text)?;
         if value.get("type").and_then(Value::as_str) == Some("hello") {
             tracing::info!("socket mode hello received");
-            return Ok(None);
+            return Ok(PreparedSocketEvent::default());
         }
 
         let envelope = serde_json::from_value::<SocketEnvelope>(value)?;
-        Ok(handle_envelope(&self.config, self.started_at, envelope))
+        Ok(prepare_envelope(&self.config, self.started_at, envelope))
+    }
+
+    fn spawn_action(&self, action: SocketAction) {
+        let lifecycle = Arc::clone(&self.lifecycle);
+        tokio::spawn(async move {
+            let result = match action {
+                SocketAction::StartCodex(command) => lifecycle.start_from_slash(command).await,
+                SocketAction::ResumeCodex(event) => lifecycle.resume_from_message(event).await,
+            };
+
+            if let Err(error) = result {
+                tracing::error!(error = %error, "socket action failed");
+            }
+        });
     }
 }
 
@@ -127,7 +248,7 @@ pub struct SocketEnvelope {
     pub payload: Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
 pub struct SlashCommandPayload {
     pub team_id: String,
     pub channel_id: String,
@@ -135,6 +256,22 @@ pub struct SlashCommandPayload {
     pub command: String,
     #[serde(default)]
     pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+pub struct SlackMessageEvent {
+    pub channel: String,
+    pub user: Option<String>,
+    #[serde(default)]
+    pub text: String,
+    pub ts: String,
+    pub thread_ts: Option<String>,
+}
+
+impl SlackMessageEvent {
+    pub fn thread_ts(&self) -> &str {
+        self.thread_ts.as_deref().unwrap_or(&self.ts)
+    }
 }
 
 #[derive(Debug, Serialize, Eq, PartialEq)]
@@ -156,62 +293,142 @@ pub enum ResponseType {
     Ephemeral,
 }
 
-pub fn handle_envelope(
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct PreparedSocketEvent {
+    pub ack: Option<SocketAck>,
+    pub action: Option<SocketAction>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum SocketAction {
+    StartCodex(SlashCommandPayload),
+    ResumeCodex(SlackMessageEvent),
+}
+
+pub fn prepare_envelope(
     config: &AppConfig,
     started_at: Instant,
     envelope: SocketEnvelope,
-) -> Option<SocketAck> {
-    if envelope.envelope_type != "slash_commands" {
-        return Some(SocketAck {
-            envelope_id: envelope.envelope_id,
-            payload: None,
-        });
-    }
-
-    let payload = serde_json::from_value::<SlashCommandPayload>(envelope.payload);
-    let response = match payload {
-        Ok(command) => handle_slash_command(config, started_at, command),
-        Err(error) => SlackResponsePayload {
-            response_type: ResponseType::Ephemeral,
-            text: format!("Could not parse Slack command payload: {error}"),
+) -> PreparedSocketEvent {
+    match envelope.envelope_type.as_str() {
+        "slash_commands" => prepare_slash_command(config, started_at, envelope),
+        "events_api" => prepare_events_api(envelope),
+        _ => PreparedSocketEvent {
+            ack: Some(SocketAck {
+                envelope_id: envelope.envelope_id,
+                payload: None,
+            }),
+            action: None,
         },
+    }
+}
+
+fn prepare_slash_command(
+    config: &AppConfig,
+    started_at: Instant,
+    envelope: SocketEnvelope,
+) -> PreparedSocketEvent {
+    let (response, action) = match serde_json::from_value::<SlashCommandPayload>(envelope.payload) {
+        Ok(command) => handle_slash_command(config, started_at, command),
+        Err(error) => (
+            SlackResponsePayload {
+                response_type: ResponseType::Ephemeral,
+                text: format!("Could not parse Slack command payload: {error}"),
+            },
+            None,
+        ),
     };
 
-    Some(SocketAck {
-        envelope_id: envelope.envelope_id,
-        payload: if envelope.accepts_response_payload {
-            Some(response)
-        } else {
-            None
-        },
-    })
+    PreparedSocketEvent {
+        ack: Some(SocketAck {
+            envelope_id: envelope.envelope_id,
+            payload: if envelope.accepts_response_payload {
+                Some(response)
+            } else {
+                None
+            },
+        }),
+        action,
+    }
+}
+
+fn prepare_events_api(envelope: SocketEnvelope) -> PreparedSocketEvent {
+    let action = parse_message_event(envelope.payload).map(SocketAction::ResumeCodex);
+
+    PreparedSocketEvent {
+        ack: Some(SocketAck {
+            envelope_id: envelope.envelope_id,
+            payload: None,
+        }),
+        action,
+    }
+}
+
+pub fn parse_message_event(payload: Value) -> Option<SlackMessageEvent> {
+    let event = payload.get("event")?;
+    if event.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    if event.get("bot_id").is_some() {
+        return None;
+    }
+    if matches!(
+        event.get("subtype").and_then(Value::as_str),
+        Some("bot_message" | "message_deleted" | "message_changed")
+    ) {
+        return None;
+    }
+
+    serde_json::from_value::<SlackMessageEvent>(event.clone()).ok()
 }
 
 fn handle_slash_command(
     config: &AppConfig,
     started_at: Instant,
     command: SlashCommandPayload,
-) -> SlackResponsePayload {
+) -> (SlackResponsePayload, Option<SocketAction>) {
     if !is_command_allowed(config, &command) {
-        return SlackResponsePayload {
-            response_type: ResponseType::Ephemeral,
-            text: "This Slack team or user is not allowed to use this host.".to_owned(),
-        };
+        return (
+            SlackResponsePayload {
+                response_type: ResponseType::Ephemeral,
+                text: "This Slack team or user is not allowed to use this host.".to_owned(),
+            },
+            None,
+        );
     }
 
-    if command.command == "/codex-ping" {
-        SlackResponsePayload {
-            response_type: ResponseType::Ephemeral,
-            text: ping_text(&config.bot_hostname, started_at),
-        }
-    } else {
-        SlackResponsePayload {
-            response_type: ResponseType::Ephemeral,
-            text: format!(
-                "Unsupported command {}. Use /codex-ping to check this host.",
-                command.command
-            ),
-        }
+    match command.command.as_str() {
+        "/codex-ping" => (
+            SlackResponsePayload {
+                response_type: ResponseType::Ephemeral,
+                text: ping_text(&config.bot_hostname, started_at),
+            },
+            None,
+        ),
+        "/codex" if command.text.trim().is_empty() => (
+            SlackResponsePayload {
+                response_type: ResponseType::Ephemeral,
+                text: "Usage: /codex <prompt>".to_owned(),
+            },
+            None,
+        ),
+        "/codex" => (
+            SlackResponsePayload {
+                response_type: ResponseType::Ephemeral,
+                text: "Starting Codex. A thread reply will appear shortly.".to_owned(),
+            },
+            Some(SocketAction::StartCodex(command)),
+        ),
+        _ => (
+            SlackResponsePayload {
+                response_type: ResponseType::Ephemeral,
+                text: format!(
+                    "Unsupported command {}. Use /codex-ping or /codex <prompt>.",
+                    command.command
+                ),
+            },
+            None,
+        ),
     }
 }
 
@@ -285,37 +502,125 @@ mod tests {
             }),
         };
 
-        let ack = handle_envelope(&test_config(), started_at, envelope).unwrap();
+        let prepared = prepare_envelope(&test_config(), started_at, envelope);
+        let ack = prepared.ack.unwrap();
 
         assert_eq!(ack.envelope_id, "E1");
         let payload = ack.payload.unwrap();
         assert_eq!(payload.response_type, ResponseType::Ephemeral);
         assert_eq!(payload.text, "pong from desk (uptime 7s)");
+        assert_eq!(prepared.action, None);
+    }
+
+    #[test]
+    fn codex_command_acknowledges_and_queues_action() {
+        let envelope = SocketEnvelope {
+            envelope_id: "E2".to_owned(),
+            envelope_type: "slash_commands".to_owned(),
+            accepts_response_payload: true,
+            payload: serde_json::json!({
+                "team_id": "T123",
+                "channel_id": "D123",
+                "user_id": "U123",
+                "command": "/codex",
+                "text": "do work"
+            }),
+        };
+
+        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+
+        assert!(prepared
+            .ack
+            .unwrap()
+            .payload
+            .unwrap()
+            .text
+            .contains("Starting Codex"));
+        assert_eq!(
+            prepared.action,
+            Some(SocketAction::StartCodex(SlashCommandPayload {
+                team_id: "T123".to_owned(),
+                channel_id: "D123".to_owned(),
+                user_id: "U123".to_owned(),
+                command: "/codex".to_owned(),
+                text: "do work".to_owned()
+            }))
+        );
     }
 
     #[test]
     fn non_slash_envelope_is_acknowledged_without_payload() {
         let envelope = SocketEnvelope {
-            envelope_id: "E2".to_owned(),
-            envelope_type: "events_api".to_owned(),
+            envelope_id: "E3".to_owned(),
+            envelope_type: "unknown".to_owned(),
             accepts_response_payload: true,
             payload: serde_json::json!({ "event": { "type": "message" } }),
         };
 
         assert_eq!(
-            handle_envelope(&test_config(), Instant::now(), envelope),
-            Some(SocketAck {
-                envelope_id: "E2".to_owned(),
-                payload: None
-            })
+            prepare_envelope(&test_config(), Instant::now(), envelope),
+            PreparedSocketEvent {
+                ack: Some(SocketAck {
+                    envelope_id: "E3".to_owned(),
+                    payload: None
+                }),
+                action: None
+            }
         );
+    }
+
+    #[test]
+    fn message_event_queues_resume_action() {
+        let envelope = SocketEnvelope {
+            envelope_id: "E4".to_owned(),
+            envelope_type: "events_api".to_owned(),
+            accepts_response_payload: false,
+            payload: serde_json::json!({
+                "event": {
+                    "type": "message",
+                    "channel": "D123",
+                    "user": "U123",
+                    "text": "continue",
+                    "ts": "171.0002",
+                    "thread_ts": "171.0001"
+                }
+            }),
+        };
+
+        let prepared = prepare_envelope(&test_config(), Instant::now(), envelope);
+
+        assert_eq!(
+            prepared.action,
+            Some(SocketAction::ResumeCodex(SlackMessageEvent {
+                channel: "D123".to_owned(),
+                user: Some("U123".to_owned()),
+                text: "continue".to_owned(),
+                ts: "171.0002".to_owned(),
+                thread_ts: Some("171.0001".to_owned())
+            }))
+        );
+    }
+
+    #[test]
+    fn bot_message_event_is_ignored() {
+        let payload = serde_json::json!({
+            "event": {
+                "type": "message",
+                "bot_id": "B123",
+                "channel": "D123",
+                "text": "from bot",
+                "ts": "171.0002"
+            }
+        });
+
+        assert_eq!(parse_message_event(payload), None);
     }
 
     #[test]
     fn ack_serialization_does_not_include_tokens() {
         let started_at = Instant::now();
         let envelope = SocketEnvelope {
-            envelope_id: "E3".to_owned(),
+            envelope_id: "E5".to_owned(),
             envelope_type: "slash_commands".to_owned(),
             accepts_response_payload: true,
             payload: serde_json::json!({
@@ -326,7 +631,9 @@ mod tests {
             }),
         };
 
-        let ack = handle_envelope(&test_config(), started_at, envelope).unwrap();
+        let ack = prepare_envelope(&test_config(), started_at, envelope)
+            .ack
+            .unwrap();
         let encoded = serde_json::to_string(&ack).unwrap();
 
         assert!(!encoded.contains("xoxb-test-secret"));
@@ -337,7 +644,7 @@ mod tests {
     #[test]
     fn disallowed_user_gets_sanitized_response() {
         let envelope = SocketEnvelope {
-            envelope_id: "E4".to_owned(),
+            envelope_id: "E6".to_owned(),
             envelope_type: "slash_commands".to_owned(),
             accepts_response_payload: true,
             payload: serde_json::json!({
@@ -348,7 +655,9 @@ mod tests {
             }),
         };
 
-        let ack = handle_envelope(&test_config(), Instant::now(), envelope).unwrap();
+        let ack = prepare_envelope(&test_config(), Instant::now(), envelope)
+            .ack
+            .unwrap();
         let text = ack.payload.unwrap().text;
 
         assert_eq!(
